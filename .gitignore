@@ -1,0 +1,7 @@
+node_modules/
+# 課程資料與服務帳戶金鑰不要上傳到公開的 GitHub
+*.csv
+*-firebase-adminsdk-*.json
+service-account*.json
+# 參考截圖
+1793071214436.jpg

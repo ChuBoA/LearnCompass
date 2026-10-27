@@ -1,0 +1,12 @@
+{
+  "name": "learn-compass",
+  "private": true,
+  "type": "module",
+  "description": "學習羅盤 LearnCompass：每日推播提醒腳本（由 GitHub Actions 執行）",
+  "scripts": {
+    "remind": "node scripts/send-reminders.mjs"
+  },
+  "dependencies": {
+    "firebase-admin": "^12.7.0"
+  }
+}
