@@ -5,7 +5,14 @@
 self.LC_CONFIG = {
   // Firebase 主控台 > 專案設定 > 一般 > 你的應用程式 > SDK 設定
   // 留空（null）時，網頁會以「本機模式」運作，資料只存在這台裝置。
-  firebase: null,
+  firebase: {
+  apiKey: "AIzaSyCTy7xoI67OuydfKglTGWwFeunKdGwQYQI",
+  authDomain: "learn-compass-b63b1.firebaseapp.com",
+  projectId: "learn-compass-b63b1",
+  storageBucket: "learn-compass-b63b1.firebasestorage.app",
+  messagingSenderId: "701770077294",
+  appId: "1:701770077294:web:63cf253fec69decce9c27f"
+  } ,
   // 範例：
   // firebase: {
   //   apiKey: "AIza...",
@@ -17,5 +24,5 @@ self.LC_CONFIG = {
   // },
 
   // Firebase 主控台 > 專案設定 > Cloud Messaging > 網路設定 > 網路推播憑證 的「金鑰組」
-  vapidKey: ""
+  vapidKey: "BAqcytn_kbmhKdh5-osOHjn2U8G-sSetuf4G70cX-19qNnL66PMOJPZ7hxEClPmERIVlAvDYWTLTcNZW6-qqqs0"
 };
