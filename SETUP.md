@@ -103,6 +103,64 @@ GitHub 上的 repository →「Actions」→ 左側「每日學習提醒」→ �
 
 ---
 
+## 第 9 步：開啟筆記附件（圖片與檔案存到 Google 雲端硬碟）
+
+附件會存到你自己 Google 雲端硬碟裡的「學習羅盤」資料夾，不用付費。APP 只會申請 **drive.file** 權限，意思是它**只能看到自己上傳的檔案**，看不到你雲端硬碟裡的其他東西。
+
+以下網址都會直接打開你的 Firebase 專案（learn-compass-b63b1）對應的 Google Cloud 頁面，請用建立 Firebase 的同一個 Google 帳號登入。
+
+### 9-1 啟用 Google Drive API
+1. 打開 https://console.cloud.google.com/apis/library/drive.googleapis.com?project=learn-compass-b63b1
+2. 按藍色的「**啟用**」。已經顯示「管理」就代表啟用好了。
+
+### 9-2 加入雲端硬碟權限
+1. 打開 https://console.cloud.google.com/auth/scopes?project=learn-compass-b63b1 （左側選單「資料存取權」）。
+2. 按「**新增或移除範圍**」。
+3. 在右側清單上方的篩選框輸入 `drive.file`，勾選
+   `.../auth/drive.file`（說明是「查看、編輯、建立及刪除您透過這個應用程式使用的 Google 雲端硬碟檔案」）。
+4. 按最下方「**更新**」，再按頁面最下方「**Save**／儲存」。
+
+> 如果頁面要你先設定「品牌宣傳」（應用程式名稱、支援電子郵件）：應用程式名稱填「學習羅盤」，電子郵件選你的 Gmail，其他留空，儲存後再回來做第 2 步。
+
+### 9-3 讓自己可以授權
+1. 打開 https://console.cloud.google.com/auth/audience?project=learn-compass-b63b1 （左側選單「目標對象」）。
+2. 看「發布狀態」：
+   - 如果是「**測試中**」：往下找「測試使用者」→「**Add users**／新增使用者」→ 輸入你的 Gmail → 儲存。
+   - 如果已經是「**正式版**」：不用動。
+3. 第一次連結時，Google 可能會顯示「**Google 尚未驗證這個應用程式**」。這是因為 APP 是你自己做的，按「**進階**」→「**前往學習羅盤（不安全）**」即可。
+
+### 9-4 允許網站使用並取得「用戶端 ID」
+1. 打開 https://console.cloud.google.com/auth/clients?project=learn-compass-b63b1 （左側選單「用戶端」）。
+2. 點名稱為「**Web client (auto created by Google Service)**」的那一個（Firebase 自動建立的）。
+3. 在「**已授權的 JavaScript 來源**」按「新增 URI」，加入這兩個（一行一個，結尾不要加 `/`）：
+   - `https://chuboa.github.io`
+   - `http://localhost:8080`（讓我在你電腦上測試用，可以不加）
+4. 按最下方「**儲存**」。設定生效最多可能要幾分鐘。
+5. 同一頁右側（或上方）有「**用戶端 ID**」，長得像 `701770077294-xxxxxxxx.apps.googleusercontent.com`，按旁邊的複製圖示。
+   - ⚠️ 只要複製「用戶端 ID」。**「用戶端密鑰」（Client secret）不要複製、不要給任何人**，這個 APP 用不到它。
+
+### 9-5 填入 config.js 並上線
+1. 用記事本打開 `config.js`，找到：
+   ```js
+   googleClientId: "",
+   ```
+   把剛剛複製的用戶端 ID 貼在兩個引號中間，例如：
+   ```js
+   googleClientId: "701770077294-xxxxxxxx.apps.googleusercontent.com",
+   ```
+2. 存檔 → GitHub Desktop 左下 Summary 填「設定雲端硬碟」→ **Commit to main** → **Push origin**。
+3. 等 1～2 分鐘，打開 APP 的「設定」→「Google 雲端硬碟」→「**連結雲端硬碟**」→ 選你的帳號 → 允許。
+4. 打開任何一篇筆記，按工具列最前面的「圖片」或「迴紋針」圖示，就能加入附件。
+
+### 使用說明
+- **圖片**：手機可直接拍照或從相簿選；電腦可拖曳圖片到筆記上，或直接貼上截圖（Ctrl+V）。圖片會自動壓縮成長邊 1600 像素，筆記裡另存一張小縮圖，所以沒網路也看得到縮圖。
+- **檔案**：PDF、Word、Excel 等都可以，每個最多 20 MB，每篇筆記最多 30 個附件。點檔案會在 Google 雲端硬碟中打開。
+- **沒網路時**：附件先存在這台裝置，顯示「尚未上傳」，連線後自動上傳。
+- **授權每次約 1 小時**：這是 Google 的安全規定。過期後要上傳或看原圖時，APP 會顯示「連結並上傳」按鈕，按一下就好（通常不用再選帳號）。
+- **刪除附件或筆記**：雲端硬碟裡的檔案會移到**垃圾桶**，30 天內都能從雲端硬碟救回。
+
+---
+
 ## 提醒規則
 
 都可以在 APP 的「設定」頁調整：

@@ -23,6 +23,10 @@ self.LC_CONFIG = {
   //   appId: "1:1234567890:web:abcdef"
   // },
 
+  // 筆記的圖片與檔案存到 Google 雲端硬碟：Google Cloud 主控台 > API 和服務 > 憑證 > OAuth 2.0 用戶端 ID
+  // 形如 "1234567890-xxxxxxxx.apps.googleusercontent.com"；留空就不能加附件（SETUP.md 第 9 步）
+  googleClientId: "",
+
   // Firebase 主控台 > 專案設定 > Cloud Messaging > 網路設定 > 網路推播憑證 的「金鑰組」
   vapidKey: "BAqcytn_kbmhKdh5-osOHjn2U8G-sSetuf4G70cX-19qNnL66PMOJPZ7hxEClPmERIVlAvDYWTLTcNZW6-qqqs0"
 };

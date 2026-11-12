@@ -104,7 +104,7 @@ export function normalizeNote(n) {
     tags: Array.isArray(n.tags) ? parseTags(n.tags.join(',')) : parseTags(n.tags),
     pinned: !!n.pinned,
     todo: countTodos(html),
-    attachments: Array.isArray(n.attachments) ? n.attachments : [],
+    attachments: Array.isArray(n.attachments) ? n.attachments.map(normalizeAttachment).filter(Boolean) : [],
     createdAt: n.createdAt || now,
     updatedAt: n.updatedAt || now
   };
@@ -112,10 +112,31 @@ export function normalizeNote(n) {
 
 export const isNoteEmpty = n => !n.title && !n.text && !n.attachments.length;
 
+// 附件只存「描述資料」與小縮圖；原檔放在 Google 雲端硬碟
+export function normalizeAttachment(a) {
+  if (!a || typeof a !== 'object' || !a.id) return null;
+  const thumb = typeof a.thumb === 'string' && /^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/.test(a.thumb) && a.thumb.length < 120_000 ? a.thumb : '';
+  const link = typeof a.link === 'string' && /^https:\/\/(drive|docs)\.google\.com\//.test(a.link) ? a.link : '';
+  return {
+    id: String(a.id).slice(0, 40),
+    kind: a.kind === 'image' ? 'image' : 'file',
+    name: String(a.name || '未命名檔案').slice(0, 200),
+    mime: String(a.mime || 'application/octet-stream').slice(0, 120),
+    size: Math.max(0, Number(a.size) || 0),
+    w: Math.max(0, Number(a.w) || 0),
+    h: Math.max(0, Number(a.h) || 0),
+    thumb,
+    driveId: typeof a.driveId === 'string' ? a.driveId.slice(0, 120) : '',
+    link,
+    status: a.driveId ? 'done' : 'pending',
+    addedAt: a.addedAt || new Date().toISOString()
+  };
+}
+
 // ---------- 所見即所得編輯器 ----------
 const escHtml = s => String(s).replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
 
-export function setupRichEditor({ body, toolbar, linkPop, onChange, onNotice }) {
+export function setupRichEditor({ body, toolbar, linkPop, onChange, onNotice, onFiles }) {
   const selection = () => getSelection();
   const inBody = node => node && body.contains(node);
 
@@ -343,10 +364,15 @@ export function setupRichEditor({ body, toolbar, linkPop, onChange, onNotice }) 
     if (!data) return;
     const html = data.getData('text/html');
     const text = data.getData('text/plain');
-    if (!html && !text) {
-      if (data.files?.length) { e.preventDefault(); onNotice('圖片與檔案功能將在下一階段加入'); }
+    // 貼上的是圖片或檔案（截圖、從檔案總管複製）：交給附件處理
+    const files = [...(data.files || [])];
+    if (files.length && (!html || files.some(f => f.type.startsWith('image/')))) {
+      e.preventDefault();
+      if (onFiles) onFiles(files);
+      else onNotice('這裡不能貼上檔案');
       return;
     }
+    if (!html && !text) return;
     e.preventDefault();
     if (html) exec('insertHTML', sanitizeHtml(html));
     else exec('insertText', text);

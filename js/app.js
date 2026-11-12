@@ -8,7 +8,12 @@ import {
   AUTO_LOCK_CHOICES, lockSettings, needsUnlock, markUnlocked, markLocked, watchVisibility,
   verifyPin, setPin, clearPin, setAutoLock, isValidPin
 } from './lock.js';
-import { normalizeNote, isNoteEmpty, parseTags, setupRichEditor } from './notes.js';
+import { normalizeNote, normalizeAttachment, isNoteEmpty, parseTags, setupRichEditor } from './notes.js';
+import {
+  MAX_FILE_BYTES, MAX_ATTACHMENTS, NeedAuthError, driveConfigured, driveConnected, driveTokenExpiry,
+  setDriveAccount, preloadDrive, connectDrive, disconnectDrive, processQueue, prepareImage,
+  enqueueUpload, enqueueTrash, dropUpload, queueAll, localBlob, fetchDriveFile
+} from './drive.js';
 
 const $ = sel => document.querySelector(sel);
 const $$ = sel => [...document.querySelectorAll(sel)];
@@ -37,7 +42,11 @@ const state = {
   noteDraft: null,    // 編輯中的筆記
   noteDirty: false,
   noteTimer: null,
-  rich: null
+  rich: null,
+  notesLoaded: false,
+  localPending: new Set(), // 這台裝置還沒上傳到雲端硬碟的附件 id
+  uploadingId: null,
+  driveError: ''
 };
 
 // ---------- 小工具 ----------
@@ -108,6 +117,7 @@ async function boot() {
     onAuth: async user => {
       state.store = await storeReady;
       state.user = user;
+      setDriveAccount(user?.email);
       updateScreens();
       if (user) {
         state.settings = await state.store.getSettings().catch(() => ({ ...DEFAULT_SETTINGS }));
@@ -123,11 +133,15 @@ async function boot() {
       state.store = await storeReady;
       state.notes = notes.map(normalizeNote);
       render();
+      if (!state.notesLoaded) { state.notesLoaded = true; syncDrive(false); }
     }
   });
   state.store = await storeReady;
   bindEvents();
   switchTab(state.tab);
+  preloadDrive()?.catch(() => {});
+  addEventListener('online', () => syncDrive(false));
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') syncDrive(false); });
 }
 
 // 依狀態決定顯示：密碼鎖 > 登入 > 主畫面
@@ -285,6 +299,12 @@ function bindEvents() {
       case 'open-note': openNote(id); break;
       case 'course-notes': state.noteCourse = id; $('#nq').value = ''; switchTab('notes'); break;
       case 'note-tag': $('#nq').value = el.dataset.tag; renderNotes(); break;
+      case 'drive-connect': syncDrive(true).then(renderSettingsIfOpen); break;
+      case 'drive-disconnect':
+        if (confirm('中斷與 Google 雲端硬碟的連結？\n已上傳的檔案會留在你的雲端硬碟；之後要看原圖或上傳新附件時再連結即可。')) {
+          disconnectDrive(); renderSettingsIfOpen(); toast('已中斷雲端硬碟連結');
+        }
+        break;
     }
   });
 
@@ -626,6 +646,9 @@ function noteCard(n) {
   const course = courseById(n.courseId);
   const h = hueOf(course?.category || '筆記');
   const preview = n.text.slice(0, 220);
+  const imgs = n.attachments.filter(a => a.kind === 'image' && a.thumb);
+  const cover = imgs[0];
+  const imgCount = imgs.length;
   return `
   <article class="note-card ${n.pinned ? 'pinned' : ''}" data-action="open-note" data-id="${esc(n.id)}" tabindex="0" role="button" style="--h:${h}">
     <div class="note-card-top">
@@ -636,8 +659,10 @@ function noteCard(n) {
     <h3>${esc(n.title || '無標題筆記')}</h3>
     ${preview ? `<p class="note-preview">${esc(preview)}</p>` : ''}
     ${n.tags.length ? `<div class="tag-row">${n.tags.map(t => `<button type="button" class="tag" data-action="note-tag" data-tag="${esc(t)}">#${esc(t)}</button>`).join('')}</div>` : ''}
+    ${cover ? `<div class="note-cover"><img src="${cover.thumb}" alt="" loading="lazy">${imgCount > 1 ? `<span>+${imgCount - 1}</span>` : ''}</div>` : ''}
     <footer>
       <span>${relTime(n.updatedAt)}</span>
+      ${n.attachments.length ? `<span class="todo">${icon('clip')}${n.attachments.length}</span>` : ''}
       ${n.todo.total ? `<span class="todo ${n.todo.done === n.todo.total ? 'done' : ''}">${icon('checklist')}${n.todo.done}/${n.todo.total}</span>` : ''}
     </footer>
   </article>`;
@@ -673,8 +698,10 @@ function bindNoteEditor() {
     toolbar: $('#note-toolbar'),
     linkPop: $('#link-pop'),
     onChange: markNoteDirty,
-    onNotice: toast
+    onNotice: toast,
+    onFiles: addFiles
   });
+  bindAttachments(dialog);
   ['#note-title', '#note-tags'].forEach(sel => $(sel).addEventListener('input', markNoteDirty));
   $('#note-course').addEventListener('change', markNoteDirty);
   $('#note-title').addEventListener('keydown', e => {
@@ -708,6 +735,7 @@ function openNote(id, preset = {}) {
   $('#note-tags').value = state.noteDraft.tags.join(', ');
   $('#note-pin').setAttribute('aria-pressed', String(state.noteDraft.pinned));
   state.rich.setHtml(state.noteDraft.html);
+  renderAttachments();
   setSaveState(existing ? `上次編輯 ${relTime(existing.updatedAt)}` : '新筆記');
   $('#note-editor').showModal();
   $('#note-editor .note-scroll').scrollTop = 0;
@@ -781,10 +809,265 @@ async function deleteCurrentNote() {
   clearTimeout(state.noteTimer);
   state.noteDraft = null;
   $('#note-editor').close();
+  // 附件：還沒上傳的直接丟掉，已上傳的移到雲端硬碟的垃圾桶
+  for (const a of draft.attachments) await forgetAttachmentFile(a);
   if (stored) {
     await state.store.removeNote(draft.id);
-    toast('筆記已刪除');
+    toast(draft.attachments.length ? '筆記已刪除，附件已移到雲端硬碟的垃圾桶' : '筆記已刪除');
   }
+  syncDrive(false);
+}
+
+// ---------- 附件（Google 雲端硬碟） ----------
+const fmtSize = b => (b >= 1048576 ? `${(b / 1048576).toFixed(1)} MB` : `${Math.max(1, Math.round(b / 1024))} KB`);
+const driveLink = a => a.link || (a.driveId ? `https://drive.google.com/file/d/${encodeURIComponent(a.driveId)}/view` : '');
+
+function bindAttachments(dialog) {
+  $('#note-toolbar').addEventListener('click', e => {
+    const btn = e.target.closest('[data-attach]');
+    if (!btn) return;
+    if (!driveConfigured()) { toast('尚未設定 Google 雲端硬碟，請依 SETUP.md 第 9 步完成設定'); return; }
+    $(btn.dataset.attach === 'image' ? '#attach-image' : '#attach-file').click();
+  });
+  ['#attach-image', '#attach-file'].forEach(sel => $(sel).addEventListener('change', e => {
+    const files = [...e.target.files];
+    e.target.value = '';
+    if (files.length) addFiles(files);
+  }));
+
+  // 拖曳檔案到筆記上（電腦）
+  let depth = 0;
+  const hasFiles = e => [...(e.dataTransfer?.types || [])].includes('Files');
+  dialog.addEventListener('dragenter', e => { if (!hasFiles(e)) return; e.preventDefault(); depth++; $('#drop-hint').hidden = false; });
+  dialog.addEventListener('dragover', e => { if (hasFiles(e)) e.preventDefault(); });
+  dialog.addEventListener('dragleave', e => { if (!hasFiles(e)) return; depth = Math.max(0, depth - 1); if (!depth) $('#drop-hint').hidden = true; });
+  dialog.addEventListener('drop', e => {
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    depth = 0;
+    $('#drop-hint').hidden = true;
+    addFiles([...e.dataTransfer.files]);
+  });
+
+  $('#note-attachments').addEventListener('click', e => {
+    const el = e.target.closest('[data-att-act]');
+    if (!el || !state.noteDraft) return;
+    const att = state.noteDraft.attachments.find(a => a.id === el.dataset.att);
+    switch (el.dataset.attAct) {
+      case 'sync': syncDrive(true); break;
+      case 'remove': if (att) removeAttachment(att); break;
+      case 'view': if (att) openAttachment(att); break;
+    }
+  });
+
+  $('#viewer-close').addEventListener('click', () => $('#viewer').close());
+  $('#viewer').addEventListener('click', e => { if (e.target.id === 'viewer' || e.target.id === 'viewer-stage') $('#viewer').close(); });
+  $('#viewer').addEventListener('close', () => {
+    const img = $('#viewer-img');
+    if (img.dataset.blobUrl) URL.revokeObjectURL(img.dataset.blobUrl);
+    img.removeAttribute('src');
+    delete img.dataset.blobUrl;
+  });
+}
+
+async function refreshLocalPending() {
+  try { state.localPending = new Set((await queueAll()).filter(i => i.op === 'upload').map(i => i.attId)); }
+  catch { state.localPending = new Set(); }
+}
+
+async function addFiles(files) {
+  if (!state.noteDraft) return;
+  if (!driveConfigured()) { toast('尚未設定 Google 雲端硬碟，請依 SETUP.md 第 9 步完成設定'); return; }
+  const noteId = state.noteDraft.id;
+  const room = MAX_ATTACHMENTS - state.noteDraft.attachments.length;
+  if (room <= 0) { toast(`每篇筆記最多 ${MAX_ATTACHMENTS} 個附件`); return; }
+  if (files.length > room) toast(`每篇筆記最多 ${MAX_ATTACHMENTS} 個附件，只加入前 ${room} 個`);
+  setSaveState('處理附件中…');
+  let added = 0;
+  for (const file of files.slice(0, room)) {
+    try {
+      let item = null;
+      if (file.type.startsWith('image/') && file.type !== 'image/svg+xml') {
+        item = await prepareImage(file).then(p => ({ ...p, kind: 'image' })).catch(() => null);
+      }
+      if (!item) item = { blob: file, mime: file.type || 'application/octet-stream', name: file.name || '檔案', kind: 'file', thumb: '', w: 0, h: 0 };
+      if (item.blob.size > MAX_FILE_BYTES) { toast(`「${file.name}」超過 20 MB，無法加入`); continue; }
+      const att = normalizeAttachment({
+        id: newId(), kind: item.kind, name: item.name, mime: item.mime, size: item.blob.size,
+        w: item.w, h: item.h, thumb: item.thumb, addedAt: new Date().toISOString()
+      });
+      await enqueueUpload(noteId, att.id, item.blob, att.name, att.mime);
+      state.localPending.add(att.id);
+      if (!updateNoteAttachments(noteId, list => [...list, att])) { await dropUpload(att.id); break; }
+      added++;
+    } catch (e) {
+      toast(`無法加入「${file.name}」：${e.message}`);
+    }
+  }
+  if (added) syncDrive(false);
+  else if (state.noteDraft?.id === noteId) setSaveState('');
+}
+
+// 更新某篇筆記的附件清單；筆記正開著就同步更新編輯器
+function updateNoteAttachments(noteId, fn) {
+  if (state.noteDraft?.id === noteId) {
+    state.noteDraft.attachments = fn(state.noteDraft.attachments);
+    state.noteDirty = true;
+    saveCurrentNote();
+    renderAttachments();
+    return true;
+  }
+  const note = state.notes.find(n => n.id === noteId);
+  if (!note) return false;
+  state.store.saveNote(normalizeNote({ ...note, attachments: fn(note.attachments), updatedAt: new Date().toISOString() }))
+    .catch(e => toast('筆記儲存失敗：' + e.message));
+  return true;
+}
+
+async function onUploaded(noteId, attId, { driveId, link }) {
+  state.localPending.delete(attId);
+  const note = state.noteDraft?.id === noteId ? state.noteDraft : state.notes.find(n => n.id === noteId);
+  // 上傳途中附件或筆記被刪掉了：把剛上傳的檔案移到垃圾桶
+  if (!note || !note.attachments.some(a => a.id === attId)) { await enqueueTrash(driveId); return; }
+  updateNoteAttachments(noteId, list => list.map(a => (a.id === attId ? normalizeAttachment({ ...a, driveId, link }) : a)));
+}
+
+async function forgetAttachmentFile(att) {
+  try {
+    if (att.driveId) await enqueueTrash(att.driveId);
+    else await dropUpload(att.id);
+  } catch { /* 忽略 */ }
+  state.localPending.delete(att.id);
+}
+
+async function removeAttachment(att) {
+  if (!confirm(`移除附件「${att.name}」？${att.driveId ? '\n檔案會移到你雲端硬碟的垃圾桶（30 天內可救回）。' : ''}`)) return;
+  const noteId = state.noteDraft.id;
+  await forgetAttachmentFile(att);
+  updateNoteAttachments(noteId, list => list.filter(a => a.id !== att.id));
+  syncDrive(false);
+}
+
+// interactive = 使用者按了按鈕：沒授權時跳出 Google 授權視窗（必須在點擊當下同步呼叫）
+async function syncDrive(interactive) {
+  if (!driveConfigured()) return;
+  try {
+    if (interactive && !driveConnected()) {
+      await connectDrive();
+      toast('已連結 Google 雲端硬碟');
+    }
+    state.driveError = '';
+    await refreshLocalPending();
+    if (driveConnected()) {
+      const result = await processQueue(onUploaded, item => {
+        state.uploadingId = item.attId || null;
+        if (item.attId) renderAttachments();
+      });
+      if (result.failed) state.driveError = `有 ${result.failed} 個項目同步失敗，稍後會再試`;
+      if (interactive && result.done) toast('附件已上傳到雲端硬碟');
+    }
+  } catch (e) {
+    state.driveError = e instanceof NeedAuthError ? '' : e.message;
+    if (interactive && !(e instanceof NeedAuthError)) toast(e.message);
+  }
+  state.uploadingId = null;
+  await refreshLocalPending();
+  renderAttachments();
+  renderSettingsIfOpen();
+}
+
+function attStatus(a) {
+  if (a.driveId) return { cls: 'done', text: '' };
+  if (state.uploadingId === a.id) return { cls: 'busy', text: '上傳中…' };
+  if (state.localPending.has(a.id)) return { cls: 'wait', text: driveConnected() && navigator.onLine ? '等待上傳' : '尚未上傳' };
+  return { cls: 'remote', text: '在另一台裝置等待上傳' };
+}
+
+function renderAttachments() {
+  const box = $('#note-attachments');
+  const draft = state.noteDraft;
+  if (!box || !draft) return;
+  const list = draft.attachments;
+  box.hidden = !list.length;
+  if (!list.length) { box.innerHTML = ''; return; }
+  const waiting = list.filter(a => !a.driveId && state.localPending.has(a.id) && state.uploadingId !== a.id).length;
+  const images = list.filter(a => a.kind === 'image');
+  const files = list.filter(a => a.kind !== 'image');
+  const removeBtn = a => `<button type="button" class="att-x" data-att-act="remove" data-att="${esc(a.id)}" aria-label="移除 ${esc(a.name)}" title="移除">${icon('x')}</button>`;
+  box.innerHTML = `
+    ${waiting && !driveConnected() ? `<div class="attach-banner">${icon('cloud')}<span>${waiting} 個附件還沒上傳到 Google 雲端硬碟（已先存在這台裝置）</span><button type="button" class="btn primary small" data-att-act="sync">連結並上傳</button></div>` : ''}
+    ${state.driveError ? `<p class="attach-error">${esc(state.driveError)}</p>` : ''}
+    ${images.length ? `<div class="attach-grid">${images.map(a => {
+      const st = attStatus(a);
+      return `<figure class="att-img ${st.cls}">
+        <button type="button" class="att-open" data-att-act="view" data-att="${esc(a.id)}" aria-label="檢視 ${esc(a.name)}">
+          ${a.thumb ? `<img src="${a.thumb}" alt="" loading="lazy">` : icon('image')}
+        </button>
+        ${st.text ? `<span class="att-badge">${st.text}</span>` : ''}
+        ${removeBtn(a)}
+      </figure>`;
+    }).join('')}</div>` : ''}
+    ${files.length ? `<ul class="attach-files">${files.map(a => {
+      const st = attStatus(a);
+      return `<li class="att-file ${st.cls}">
+        <button type="button" class="att-open" data-att-act="view" data-att="${esc(a.id)}">
+          <span class="att-icon">${icon('file')}</span>
+          <span class="att-info"><b>${esc(a.name)}</b><small>${fmtSize(a.size)}${st.text ? `・${st.text}` : '・雲端硬碟'}</small></span>
+        </button>
+        ${removeBtn(a)}
+      </li>`;
+    }).join('')}</ul>` : ''}`;
+}
+
+async function openAttachment(att) {
+  if (att.kind !== 'image') {
+    if (att.driveId) { window.open(driveLink(att), '_blank', 'noopener'); return; }
+    const blob = await localBlob(att.id);
+    if (blob) { const url = URL.createObjectURL(blob); window.open(url, '_blank', 'noopener'); setTimeout(() => URL.revokeObjectURL(url), 60_000); }
+    else toast('這個檔案還在另一台裝置等待上傳');
+    return;
+  }
+  const dlg = $('#viewer');
+  const img = $('#viewer-img');
+  const note = $('#viewer-note');
+  $('#viewer-name').textContent = att.name;
+  const link = driveLink(att);
+  $('#viewer-drive').hidden = !link;
+  if (link) $('#viewer-drive').href = link;
+  img.src = att.thumb || '';
+  img.classList.add('loading');
+  note.hidden = true;
+  dlg.showModal();
+  const show = blob => {
+    if (!dlg.open) return;
+    const url = URL.createObjectURL(blob);
+    img.dataset.blobUrl = url;
+    img.src = url;
+    img.classList.remove('loading');
+  };
+  try {
+    const local = await localBlob(att.id);
+    if (local) { show(local); return; }
+    if (!att.driveId) { note.textContent = '原圖還在另一台裝置等待上傳，目前顯示縮圖。'; note.hidden = false; img.classList.remove('loading'); return; }
+    if (!driveConnected()) {
+      note.innerHTML = `目前顯示縮圖。<button type="button" class="btn ghost small" id="viewer-auth">連結雲端硬碟看原圖</button>`;
+      note.hidden = false;
+      $('#viewer-auth').addEventListener('click', () => {
+        syncDrive(true).then(() => { if (driveConnected() && dlg.open) { note.hidden = true; fetchDriveFile(att.driveId).then(show).catch(e => toast(e.message)); } });
+      }, { once: true });
+      img.classList.remove('loading');
+      return;
+    }
+    show(await fetchDriveFile(att.driveId));
+  } catch (e) {
+    img.classList.remove('loading');
+    if (e instanceof NeedAuthError) { note.textContent = '雲端硬碟授權已過期，請關閉後重新開啟圖片並連結。'; note.hidden = false; }
+    else { note.textContent = e.message; note.hidden = false; }
+  }
+}
+
+function renderSettingsIfOpen() {
+  if (state.tab === 'settings' && state.store) renderSettings();
 }
 
 function emptyState() {
@@ -934,6 +1217,22 @@ function renderSettings() {
         ? `<p>已登入 <b>${esc(state.user?.email || '')}</b>，資料會自動同步到所有登入同一帳號的裝置；沒有網路時也能使用，連線後再上傳。</p>
            <button class="btn ghost" type="button" data-action="logout">${icon('logout')}登出</button>`
         : `<p class="warn-text">目前是<b>本機模式</b>：資料只存在這台裝置的瀏覽器裡。完成 SETUP.md 的 Firebase 設定後，就能手機、電腦同步並開啟推播。</p>`}
+    </div>
+
+    <div class="panel">
+      <h2>${icon('cloud')}Google 雲端硬碟 <small>筆記的圖片與檔案</small></h2>
+      ${!driveConfigured()
+        ? '<p class="warn-text">尚未設定。依 SETUP.md 第 9 步取得「用戶端 ID」並填入 config.js 的 googleClientId，就能在筆記加入圖片與檔案。</p>'
+        : `<p>附件會存到你雲端硬碟的「<b>學習羅盤</b>」資料夾。APP 只能存取它自己上傳的檔案，看不到你雲端硬碟裡的其他東西。</p>
+           <p class="muted-text">${driveConnected()
+             ? `✅ 已連結（授權到 ${new Intl.DateTimeFormat('zh-TW', { hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).format(driveTokenExpiry())}，之後需要時會再請你按一次連結）`
+             : '尚未連結，或授權已過期（Google 的授權每次約 1 小時）。'}
+             ${state.localPending.size ? `・這台裝置有 <b>${state.localPending.size}</b> 個附件等待上傳` : ''}</p>
+           ${state.driveError ? `<p class="warn-text">${esc(state.driveError)}</p>` : ''}
+           <div class="row wrap">
+             <button class="btn primary" type="button" data-action="drive-connect">${icon('cloud')}${driveConnected() ? (state.localPending.size ? '立即上傳' : '重新整理') : (state.localPending.size ? '連結並上傳' : '連結雲端硬碟')}</button>
+             ${driveConnected() ? `<button class="btn ghost" type="button" data-action="drive-disconnect">中斷連結</button>` : ''}
+           </div>`}
     </div>
 
     <div class="panel">
