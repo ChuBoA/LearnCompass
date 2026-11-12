@@ -1,10 +1,10 @@
 // Service Worker：離線快取 + Firebase 推播
 importScripts('./config.js');
 
-const CACHE = 'lc-v2';
+const CACHE = 'lc-v3';
 const ASSETS = [
   './', './index.html', './config.js', './manifest.webmanifest',
-  './css/style.css', './js/app.js', './js/store.js', './js/csv.js', './js/reminders.js', './js/lock.js',
+  './css/style.css', './js/app.js', './js/store.js', './js/csv.js', './js/reminders.js', './js/lock.js', './js/notes.js',
   './icons/icon.svg', './icons/icon-192.png', './icons/icon-512.png', './icons/apple-touch-icon.png'
 ];
 
