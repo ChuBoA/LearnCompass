@@ -1,7 +1,7 @@
 // Service Worker：離線快取 + Firebase 推播
 importScripts('./config.js');
 
-const CACHE = 'lc-v3';
+const CACHE = 'lc-v4';
 const ASSETS = [
   './', './index.html', './config.js', './manifest.webmanifest',
   './css/style.css', './js/app.js', './js/store.js', './js/csv.js', './js/reminders.js', './js/lock.js', './js/notes.js',
@@ -9,7 +9,10 @@ const ASSETS = [
 ];
 
 self.addEventListener('install', event => {
-  event.waitUntil(caches.open(CACHE).then(c => c.addAll(ASSETS)).then(() => self.skipWaiting()));
+  // cache: 'reload' 直接向伺服器拿最新檔，避免存到瀏覽器裡的舊版本
+  event.waitUntil(caches.open(CACHE)
+    .then(c => c.addAll(ASSETS.map(url => new Request(url, { cache: 'reload' }))))
+    .then(() => self.skipWaiting()));
 });
 
 self.addEventListener('activate', event => {

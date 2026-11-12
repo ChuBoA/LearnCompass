@@ -79,7 +79,21 @@ const isStandalone = () => matchMedia('(display-mode: standalone)').matches || n
 // ---------- 啟動 ----------
 async function boot() {
   if ('serviceWorker' in navigator) {
-    navigator.serviceWorker.register('sw.js').catch(err => console.warn('Service worker 註冊失敗', err));
+    const hadController = !!navigator.serviceWorker.controller;
+    navigator.serviceWorker.register('sw.js').then(reg => {
+      // APP 常駐在背景時，每次切回來都檢查一次有沒有新版
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible') reg.update().catch(() => {});
+      });
+    }).catch(err => console.warn('Service worker 註冊失敗', err));
+    // 新版接手後自動重新整理一次，直接換成新畫面
+    let reloading = false;
+    navigator.serviceWorker.addEventListener('controllerchange', () => {
+      if (!hadController || reloading) return;
+      reloading = true;
+      try { saveCurrentNote(); } catch { /* 忽略 */ }
+      setTimeout(() => location.reload(), 300);
+    });
   }
   addEventListener('beforeinstallprompt', e => { e.preventDefault(); state.installPrompt = e; if (state.tab === 'settings') renderSettings(); });
 
