@@ -8,16 +8,16 @@ import {
   AUTO_LOCK_CHOICES, lockSettings, needsUnlock, markUnlocked, markLocked, watchVisibility,
   verifyPin, setPin, clearPin, setAutoLock, isValidPin
 } from './lock.js';
-import { normalizeNote, isNoteEmpty, parseTags, setupRichEditor } from './notes.js';
 
 const $ = sel => document.querySelector(sel);
 const $$ = sel => [...document.querySelectorAll(sel)];
 
-const CATEGORY_EMOJI = {
-  心靈成長: '🧘', 理財投資: '💰', 程式設計: '💻', 平面創作: '🎨', 語言學習: '🗣️',
-  生活技能: '🏠', 學術報告: '📊', 健康運動: '🏃', 親子教育: '👶', 聲音藝術: '🎤'
-};
-const DEFAULT_CATEGORIES = Object.keys(CATEGORY_EMOJI);
+// 預設分類；使用者在「設定 > 分類管理」改過之後，就以存在雲端設定裡的清單為準
+const DEFAULT_CATEGORY_LIST = [
+  ['心靈成長', '🧘'], ['理財投資', '💰'], ['程式設計', '💻'], ['平面創作', '🎨'], ['語言學習', '🗣️'],
+  ['生活技能', '🏠'], ['學術報告', '📊'], ['健康運動', '🏃'], ['親子教育', '👶'], ['聲音藝術', '🎤']
+].map(([name, emoji]) => ({ name, emoji }));
+const DEFAULT_EMOJI = '📚';
 const STATUS_LABEL = { notStarted: '未開始', inProgress: '學習中', done: '已完成', expired: '已過期' };
 
 const state = {
@@ -31,13 +31,7 @@ const state = {
   pinEntry: '',
   pinFails: 0,
   pinWaitUntil: 0,
-  pinMode: 'set',
-  notes: [],
-  noteCourse: '',     // 筆記頁的課程篩選：'' 全部、'__none' 未連結課程、或課程 id
-  noteDraft: null,    // 編輯中的筆記
-  noteDirty: false,
-  noteTimer: null,
-  rich: null
+  pinMode: 'set'
 };
 
 // ---------- 小工具 ----------
@@ -48,7 +42,19 @@ const safeUrl = u => (/^https?:\/\//i.test(u || '') ? u : '');
 const linkify = text => esc(text).replace(/https?:\/\/[^\s<]+/g, url => `<a href="${url}" target="_blank" rel="noopener">${url}</a>`);
 const icon = name => `<svg class="i"><use href="#i-${name}"/></svg>`;
 const sum = (arr, f) => arr.reduce((t, x) => t + (f(x) || 0), 0);
-const emojiOf = cat => CATEGORY_EMOJI[cat] || '📚';
+
+// 分類清單：[{ name, emoji }]
+function categoryList() {
+  const saved = state.settings.categories;
+  if (Array.isArray(saved)) return saved;
+  // 還沒管理過：預設分類 + 課程裡已經用到的其他分類
+  const list = DEFAULT_CATEGORY_LIST.map(c => ({ ...c }));
+  state.courses.forEach(c => {
+    if (c.category && !list.some(x => x.name === c.category)) list.push({ name: c.category, emoji: DEFAULT_EMOJI });
+  });
+  return list;
+}
+const emojiOf = cat => categoryList().find(c => c.name === cat)?.emoji || DEFAULT_EMOJI;
 
 function hueOf(text) {
   let h = 0;
@@ -91,7 +97,6 @@ async function boot() {
     navigator.serviceWorker.addEventListener('controllerchange', () => {
       if (!hadController || reloading) return;
       reloading = true;
-      try { saveCurrentNote(); } catch { /* 忽略 */ }
       setTimeout(() => location.reload(), 300);
     });
   }
@@ -118,11 +123,6 @@ async function boot() {
       state.store = await storeReady;
       state.courses = courses.map(normalizeCourse);
       render();
-    },
-    onNotes: async notes => {
-      state.store = await storeReady;
-      state.notes = notes.map(normalizeNote);
-      render();
     }
   });
   state.store = await storeReady;
@@ -145,7 +145,6 @@ function bindLock() {
     if (state.locked) return;
     state.locked = true;
     state.pinEntry = '';
-    closeNote();
     $$('dialog[open]').forEach(d => d.close());
     updateScreens();
   });
@@ -271,7 +270,7 @@ function bindEvents() {
       case 'go': break;
       case 'import': $('#file-import').click(); break;
       case 'export-csv': download(`學習羅盤_${taipeiToday()}.csv`, coursesToCsv(sortedForExport()), 'text/csv;charset=utf-8'); break;
-      case 'export-json': download(`學習羅盤備份_${taipeiToday()}.json`, JSON.stringify({ version: 2, courses: state.courses, notes: state.notes, settings: state.settings }, null, 2), 'application/json'); break;
+      case 'export-json': download(`學習羅盤備份_${taipeiToday()}.json`, JSON.stringify({ version: 1, courses: state.courses, settings: state.settings }, null, 2), 'application/json'); break;
       case 'logout': if (confirm('確定要登出嗎？')) state.store.signOut(); break;
       case 'tab': switchTab(el.dataset.tab); break;
       case 'filter-status': $('#f-status').value = el.dataset.value; $('#f-category').value = ''; switchTab('courses'); renderCourses(); break;
@@ -280,21 +279,12 @@ function bindEvents() {
       case 'install': state.installPrompt?.prompt(); break;
       case 'clear-all': clearAll(); break;
       case 'pin': openPinDialog(el.dataset.mode); break;
-      case 'lock-now': closeNote(); markLocked(); state.locked = true; state.pinEntry = ''; updateScreens(); break;
-      case 'new-note': openNote(null, { courseId: el.dataset.course ?? (state.noteCourse !== '__none' ? state.noteCourse : '') }); break;
-      case 'open-note': openNote(id); break;
-      case 'course-notes': state.noteCourse = id; $('#nq').value = ''; switchTab('notes'); break;
-      case 'note-tag': $('#nq').value = el.dataset.tag; renderNotes(); break;
+      case 'lock-now': markLocked(); state.locked = true; state.pinEntry = ''; updateScreens(); break;
+      case 'cat-delete': deleteCategory(Number(el.dataset.i)); break;
+      case 'cat-up': moveCategory(Number(el.dataset.i), -1); break;
+      case 'cat-down': moveCategory(Number(el.dataset.i), 1); break;
     }
   });
-
-  // 筆記
-  $('#nq').addEventListener('input', renderNotes);
-  $('#n-course').addEventListener('change', e => { state.noteCourse = e.target.value; renderNotes(); });
-  $('#note-grid').addEventListener('keydown', e => {
-    if ((e.key === 'Enter' || e.key === ' ') && e.target.matches('.note-card')) { e.preventDefault(); openNote(e.target.dataset.id); }
-  });
-  bindNoteEditor();
 
   // 卡片上的學習能量滑桿：拖動時即時顯示，放開時儲存
   $('#grid').addEventListener('input', e => {
@@ -332,7 +322,33 @@ function bindEvents() {
   form.addEventListener('submit', submitEditor);
   $('#pin-form').addEventListener('submit', submitPin);
 
+  // 課程表單：選「新增分類…」
+  form.category.addEventListener('change', async () => {
+    if (form.category.value !== '__new') return;
+    const name = prompt('新分類名稱');
+    const added = name ? await addCategory(name, '') : false;
+    fillCategorySelect(added || '');
+  });
+
+  $('#view-settings').addEventListener('submit', async e => {
+    if (e.target.id !== 'cat-add') return;
+    e.preventDefault();
+    const f = e.target;
+    if (await addCategory(f.name.value, f.emoji.value)) $('#cat-add [name=name]')?.focus();
+  });
+  $('#view-settings').addEventListener('keydown', e => {
+    if (e.key === 'Enter' && e.target.closest('.cat-row')) { e.preventDefault(); e.target.blur(); }
+  });
+
   $('#view-settings').addEventListener('change', e => {
+    const row = e.target.closest('.cat-row');
+    if (row) {
+      const i = Number(row.dataset.i);
+      if (e.target.matches('.cat-name')) renameCategory(i, e.target.value);
+      else if (e.target.matches('.cat-emoji')) setCategoryEmoji(i, e.target.value);
+      return;
+    }
+    if (e.target.closest('#cat-add')) return;
     if (e.target.name === 'autoLock') { setAutoLock(Number(e.target.value)); toast('自動上鎖已更新'); return; }
     if (e.target.closest('[data-setting]')) saveSettingsFromForm();
   });
@@ -372,31 +388,23 @@ async function importFile(file) {
   try {
     const text = await file.text();
     let incoming;
-    let notes = [];
-    let settings = null;
     if (/\.json$/i.test(file.name) || text.trim().startsWith('{')) {
       const data = JSON.parse(text);
-      incoming = (Array.isArray(data) ? data : data.courses || []).map(normalizeCourse);
-      notes = (data.notes || []).map(normalizeNote);
-      settings = data.settings || null;
+      incoming = (data.courses || data).map(normalizeCourse);
+      if (data.settings) {
+        state.settings = { ...DEFAULT_SETTINGS, ...data.settings };
+        await state.store.saveSettings(state.settings);
+      }
     } else {
       incoming = csvToCourses(text);
     }
-    if (!incoming.length && !notes.length) { toast('檔案裡沒有找到課程或筆記'); return; }
+    if (!incoming.length) { toast('檔案裡沒有找到課程'); return; }
     const { courses, added, updated } = mergeImport(state.courses, incoming);
     const sessions = sum(courses, c => c.sessions.length);
-    const noteNew = notes.filter(n => !state.notes.some(o => o.id === n.id)).length;
-    const lines = [];
-    if (courses.length) lines.push(`・課程 ${courses.length} 門：新增 ${added}、更新 ${updated}（以課程名稱＋購買日期比對），共 ${sessions} 個上課場次`);
-    if (notes.length) lines.push(`・筆記 ${notes.length} 篇：新增 ${noteNew}、更新 ${notes.length - noteNew}`);
-    if (!confirm(`即將匯入：\n${lines.join('\n')}\n\n確定匯入？`)) return;
-    if (courses.length) await state.store.saveMany(courses);
-    if (notes.length) await state.store.saveNotes(notes);
-    if (settings) {
-      state.settings = { ...DEFAULT_SETTINGS, ...settings };
-      await state.store.saveSettings(state.settings);
-    }
-    toast(`匯入完成${courses.length ? `：課程新增 ${added}、更新 ${updated}` : ''}${notes.length ? `；筆記 ${notes.length} 篇` : ''}`);
+    if (!confirm(`即將匯入 ${courses.length} 門課：\n・新增 ${added} 門\n・更新 ${updated} 門（以課程名稱＋購買日期比對）\n・共 ${sessions} 個上課場次\n\n確定匯入？`)) return;
+    await state.store.saveMany(courses);
+    await ensureCategories(courses.map(c => c.category));
+    toast(`匯入完成：新增 ${added}、更新 ${updated}`);
   } catch (e) {
     toast('匯入失敗：' + e.message);
   }
@@ -416,7 +424,6 @@ function render() {
   $('#alert-count').hidden = !urgent;
   $('#alert-count').textContent = urgent;
   if (state.tab === 'courses') renderCourses();
-  if (state.tab === 'notes') renderNotes();
   if (state.tab === 'alerts') renderAlerts(alerts);
   if (state.tab === 'stats') renderStats();
   if (state.tab === 'settings') renderSettings();
@@ -494,7 +501,6 @@ function renderFilters() {
   const cats = uniqueValues('category');
   sel.innerHTML = `<option value="">全部分類</option>` + cats.map(c => `<option value="${esc(c)}">${emojiOf(c)} ${esc(c)}</option>`).join('');
   sel.value = cats.includes(current) ? current : '';
-  $('#dl-category').innerHTML = uniqueValues('category', DEFAULT_CATEGORIES).map(v => `<option value="${esc(v)}">`).join('');
   $('#dl-platform').innerHTML = uniqueValues('platform').map(v => `<option value="${esc(v)}">`).join('');
   $('#dl-teacher').innerHTML = uniqueValues('teacher').map(v => `<option value="${esc(v)}">`).join('');
 }
@@ -532,7 +538,7 @@ function expiryBadge(course, today) {
   return `<span class="badge ${cls}" title="到期日 ${fmtDate(course.accessUntil)}">${icon('clock')}${left === 0 ? '今天到期' : `剩餘 ${left} 天`}</span>`;
 }
 
-function courseCard(c, today, noteCount = 0) {
+function courseCard(c, today) {
   const next = upcomingSessions(c, today)[0];
   const status = courseStatus(c, today);
   const link = safeUrl(c.link);
@@ -561,7 +567,6 @@ function courseCard(c, today, noteCount = 0) {
     <div class="card-actions">
       ${link ? `<a class="btn dark" data-action="go" href="${esc(link)}" target="_blank" rel="noopener">前往課程${icon('arrow')}</a>`
              : `<span class="btn dark disabled">尚無連結</span>`}
-      <button class="btn soft notes-btn ${noteCount ? 'has' : ''}" type="button" data-action="course-notes" data-id="${esc(c.id)}" aria-label="筆記 ${noteCount} 篇" title="筆記">${icon('note')}${noteCount ? `<b>${noteCount}</b>` : ''}</button>
       <button class="btn soft icon-only" type="button" data-action="edit" data-id="${esc(c.id)}" aria-label="編輯">${icon('edit')}</button>
       <button class="btn plain icon-only" type="button" data-action="delete" data-id="${esc(c.id)}" aria-label="刪除">${icon('trash')}</button>
     </div>
@@ -573,218 +578,7 @@ function renderCourses() {
   const list = filteredCourses();
   $('#result-count').textContent = state.courses.length
     ? `共 ${list.length} 門課・${money(sum(list, c => c.price))}` : '';
-  const counts = noteCounts();
-  $('#grid').innerHTML = list.length ? list.map(c => courseCard(c, today, counts.get(c.id) || 0)).join('') : emptyState();
-}
-
-// ---------- 筆記 ----------
-function noteCounts() {
-  const counts = new Map();
-  for (const n of state.notes) if (n.courseId) counts.set(n.courseId, (counts.get(n.courseId) || 0) + 1);
-  return counts;
-}
-
-const courseById = id => state.courses.find(c => c.id === id);
-
-function relTime(iso) {
-  if (!iso) return '';
-  const d = new Date(iso);
-  const day = taipeiToday(d);
-  const today = taipeiToday();
-  const time = new Intl.DateTimeFormat('zh-TW', { timeZone: 'Asia/Taipei', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).format(d);
-  if (day === today) return `今天 ${time}`;
-  if (day === taipeiToday(new Date(Date.now() - 86400000))) return `昨天 ${time}`;
-  return day.slice(0, 4) === today.slice(0, 4) ? `${day.slice(5, 7)}/${day.slice(8, 10)}` : fmtDate(day);
-}
-
-function renderNoteFilters() {
-  const sel = $('#n-course');
-  const counts = noteCounts();
-  const unlinked = state.notes.filter(n => !n.courseId || !courseById(n.courseId)).length;
-  const courses = state.courses.filter(c => counts.has(c.id) || c.id === state.noteCourse)
-    .sort((a, b) => (counts.get(b.id) || 0) - (counts.get(a.id) || 0) || a.name.localeCompare(b.name, 'zh-Hant'));
-  sel.innerHTML = `<option value="">全部筆記（${state.notes.length}）</option>`
-    + `<option value="__none">未連結課程（${unlinked}）</option>`
-    + courses.map(c => `<option value="${esc(c.id)}">${emojiOf(c.category)} ${esc(c.name.length > 24 ? c.name.slice(0, 24) + '…' : c.name)}（${counts.get(c.id) || 0}）</option>`).join('');
-  sel.value = state.noteCourse;
-  if (sel.value !== state.noteCourse) { state.noteCourse = ''; sel.value = ''; }
-}
-
-function filteredNotes() {
-  const q = $('#nq').value.trim().toLowerCase().replace(/^#/, '');
-  const f = state.noteCourse;
-  return state.notes.filter(n => {
-    const course = courseById(n.courseId);
-    if (f === '__none' && course) return false;
-    if (f && f !== '__none' && n.courseId !== f) return false;
-    if (!q) return true;
-    return [n.title, n.text, n.tags.join(' '), course?.name || ''].join(' ').toLowerCase().includes(q);
-  }).sort((a, b) => (b.pinned - a.pinned) || b.updatedAt.localeCompare(a.updatedAt));
-}
-
-function noteCard(n) {
-  const course = courseById(n.courseId);
-  const h = hueOf(course?.category || '筆記');
-  const preview = n.text.slice(0, 220);
-  return `
-  <article class="note-card ${n.pinned ? 'pinned' : ''}" data-action="open-note" data-id="${esc(n.id)}" tabindex="0" role="button" style="--h:${h}">
-    <div class="note-card-top">
-      ${course ? `<span class="pill">${emojiOf(course.category)} ${esc(course.name.length > 18 ? course.name.slice(0, 18) + '…' : course.name)}</span>`
-               : '<span class="pill plain">✏️ 隨手記</span>'}
-      ${n.pinned ? `<span class="pin-mark" title="已置頂">${icon('pin')}</span>` : ''}
-    </div>
-    <h3>${esc(n.title || '無標題筆記')}</h3>
-    ${preview ? `<p class="note-preview">${esc(preview)}</p>` : ''}
-    ${n.tags.length ? `<div class="tag-row">${n.tags.map(t => `<button type="button" class="tag" data-action="note-tag" data-tag="${esc(t)}">#${esc(t)}</button>`).join('')}</div>` : ''}
-    <footer>
-      <span>${relTime(n.updatedAt)}</span>
-      ${n.todo.total ? `<span class="todo ${n.todo.done === n.todo.total ? 'done' : ''}">${icon('checklist')}${n.todo.done}/${n.todo.total}</span>` : ''}
-    </footer>
-  </article>`;
-}
-
-function renderNotes() {
-  renderNoteFilters();
-  const list = filteredNotes();
-  const course = courseById(state.noteCourse);
-  $('#note-count').textContent = state.notes.length ? `共 ${list.length} 篇筆記${course ? `・${course.name}` : ''}` : '';
-  if (list.length) {
-    $('#note-grid').innerHTML = list.map(noteCard).join('');
-  } else if (course) {
-    $('#note-grid').innerHTML = `<div class="empty-state">
-      <p>《${esc(course.name)}》還沒有筆記 📝</p>
-      <p>把上課的重點、心得或待辦記下來吧。</p>
-      <button class="btn primary" type="button" data-action="new-note" data-course="${esc(course.id)}">${icon('plus')}為這門課寫第一篇筆記</button>
-    </div>`;
-  } else {
-    $('#note-grid').innerHTML = `<div class="empty-state">
-      ${state.notes.length ? '<p>找不到符合條件的筆記</p>' : `<p>還沒有任何筆記 📝</p>
-      <p>可以從課程卡片上的 ${icon('note')} 為某門課寫筆記，或在這裡寫一篇隨手記。</p>
-      <button class="btn primary" type="button" data-action="new-note">${icon('plus')}新增筆記</button>`}
-    </div>`;
-  }
-}
-
-// ---------- 筆記編輯器 ----------
-function bindNoteEditor() {
-  const dialog = $('#note-editor');
-  state.rich = setupRichEditor({
-    body: $('#note-body'),
-    toolbar: $('#note-toolbar'),
-    linkPop: $('#link-pop'),
-    onChange: markNoteDirty,
-    onNotice: toast
-  });
-  ['#note-title', '#note-tags'].forEach(sel => $(sel).addEventListener('input', markNoteDirty));
-  $('#note-course').addEventListener('change', markNoteDirty);
-  $('#note-title').addEventListener('keydown', e => {
-    if (e.key === 'Enter') { e.preventDefault(); $('#note-body').focus(); }
-  });
-  $('#note-pin').addEventListener('click', () => {
-    if (!state.noteDraft) return;
-    state.noteDraft.pinned = !state.noteDraft.pinned;
-    $('#note-pin').setAttribute('aria-pressed', String(state.noteDraft.pinned));
-    markNoteDirty();
-  });
-  $('#note-delete').addEventListener('click', deleteCurrentNote);
-  // 先存檔再關閉；dialog 的 close 事件可能延遲觸發，只當作 Esc 等情況的備援
-  $$('[data-note-close]').forEach(b => b.addEventListener('click', () => { closeNote(); dialog.close(); }));
-  dialog.addEventListener('close', closeNote);
-  // 切到背景（換 APP、鎖螢幕）時立刻存檔，避免手機把 APP 關掉時遺失內容
-  document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'hidden') saveCurrentNote();
-  });
-}
-
-function openNote(id, preset = {}) {
-  const existing = id ? state.notes.find(n => n.id === id) : null;
-  state.noteDraft = existing ? { ...existing } : normalizeNote({ courseId: preset.courseId || '' });
-  state.noteDirty = false;
-  const courses = [...state.courses].sort((a, b) => (b.purchaseDate || '').localeCompare(a.purchaseDate || ''));
-  $('#note-course').innerHTML = '<option value="">不連結課程（隨手記）</option>'
-    + courses.map(c => `<option value="${esc(c.id)}">${emojiOf(c.category)} ${esc(c.name)}</option>`).join('');
-  $('#note-course').value = courseById(state.noteDraft.courseId) ? state.noteDraft.courseId : '';
-  $('#note-title').value = state.noteDraft.title;
-  $('#note-tags').value = state.noteDraft.tags.join(', ');
-  $('#note-pin').setAttribute('aria-pressed', String(state.noteDraft.pinned));
-  state.rich.setHtml(state.noteDraft.html);
-  setSaveState(existing ? `上次編輯 ${relTime(existing.updatedAt)}` : '新筆記');
-  $('#note-editor').showModal();
-  $('#note-editor .note-scroll').scrollTop = 0;
-  if (!existing) $('#note-title').focus();
-  else $('#note-title').blur();
-}
-
-function setSaveState(text) {
-  $('#note-save-state').textContent = text;
-}
-
-function markNoteDirty() {
-  if (!state.noteDraft) return;
-  state.noteDirty = true;
-  setSaveState('編輯中…');
-  clearTimeout(state.noteTimer);
-  state.noteTimer = setTimeout(saveCurrentNote, 900);
-}
-
-function currentNote() {
-  return normalizeNote({
-    ...state.noteDraft,
-    title: $('#note-title').value,
-    html: state.rich.getHtml(),
-    tags: parseTags($('#note-tags').value),
-    courseId: $('#note-course').value,
-    updatedAt: new Date().toISOString()
-  });
-}
-
-function saveCurrentNote() {
-  clearTimeout(state.noteTimer);
-  if (!state.noteDraft || !state.noteDirty) return;
-  const note = currentNote();
-  state.noteDirty = false;
-  if (isNoteEmpty(note)) { setSaveState('空白筆記不會儲存'); return; }
-  state.noteDraft = note;
-  state.store.saveNote(note).catch(e => { toast('筆記儲存失敗：' + e.message); setSaveState('儲存失敗'); });
-  setSaveState(navigator.onLine ? '已儲存' : '已存在這台裝置，連線後同步');
-  touchCourseStudied(note.courseId);
-}
-
-// 寫筆記也算一次學習：每門課每天最多更新一次「最近學習」
-function touchCourseStudied(courseId) {
-  const course = courseById(courseId);
-  if (!course) return;
-  const today = taipeiToday();
-  if (course.lastStudiedAt && taipeiToday(new Date(course.lastStudiedAt)) === today) return;
-  const now = new Date().toISOString();
-  saveCourse({ ...course, lastStudiedAt: now, updatedAt: now });
-}
-
-function closeNote() {
-  if (!state.noteDraft) return;
-  saveCurrentNote();
-  const draft = state.noteDraft;
-  const stored = state.notes.some(n => n.id === draft.id);
-  if (stored && isNoteEmpty(currentNote())) {
-    state.store.removeNote(draft.id);
-    toast('空白筆記已刪除');
-  }
-  state.noteDraft = null;
-  $('#link-pop').hidden = true;
-}
-
-async function deleteCurrentNote() {
-  const draft = state.noteDraft;
-  if (!draft) return;
-  const stored = state.notes.some(n => n.id === draft.id);
-  if (stored && !confirm(`確定要刪除「${draft.title || '無標題筆記'}」嗎？\n刪除後無法復原。`)) return;
-  clearTimeout(state.noteTimer);
-  state.noteDraft = null;
-  $('#note-editor').close();
-  if (stored) {
-    await state.store.removeNote(draft.id);
-    toast('筆記已刪除');
-  }
+  $('#grid').innerHTML = list.length ? list.map(c => courseCard(c, today)).join('') : emptyState();
 }
 
 function emptyState() {
@@ -936,6 +730,8 @@ function renderSettings() {
         : `<p class="warn-text">目前是<b>本機模式</b>：資料只存在這台裝置的瀏覽器裡。完成 SETUP.md 的 Firebase 設定後，就能手機、電腦同步並開啟推播。</p>`}
     </div>
 
+    ${categoryPanel()}
+
     <div class="panel">
       <h2>${icon('lock')}密碼鎖 <small>只在這台裝置有效</small></h2>
       ${lock.enabled
@@ -1008,8 +804,8 @@ async function saveSettingsFromForm() {
     staleDays: Math.max(3, Number(root.querySelector('[name=staleDays]').value) || DEFAULT_SETTINGS.staleDays),
     staleDigestWeekday: Number(root.querySelector('[name=staleDigestWeekday]').value)
   };
-  state.settings = s;
-  try { await state.store.saveSettings(s); toast('提醒設定已儲存'); }
+  state.settings = { ...state.settings, ...s };
+  try { await state.store.saveSettings(state.settings); toast('提醒設定已儲存'); }
   catch (e) { toast('儲存失敗：' + e.message); }
 }
 
@@ -1055,6 +851,7 @@ function openEditor(id) {
   const form = $('#editor-form');
   form.reset();
   const c = course || { energy: 0, purchaseDate: taipeiToday(), sessions: [] };
+  fillCategorySelect(c.category || '');
   for (const key of ['name', 'teacher', 'category', 'platform', 'price', 'purchaseDate', 'accessUntil', 'energy', 'link', 'note']) {
     form[key].value = c[key] ?? '';
   }
@@ -1077,7 +874,7 @@ async function submitEditor(e) {
   }).filter(s => s.at).sort((a, b) => a.at.localeCompare(b.at));
   const course = {
     ...(old || { id: newId(), createdAt: now }),
-    name: form.name.value, teacher: form.teacher.value, category: form.category.value,
+    name: form.name.value, teacher: form.teacher.value, category: form.category.value === '__new' ? '' : form.category.value,
     platform: form.platform.value, price: form.price.value, purchaseDate: form.purchaseDate.value,
     accessUntil: form.accessUntil.value, energy, link: form.link.value, note: form.note.value,
     sessions, updatedAt: now,
@@ -1086,6 +883,123 @@ async function submitEditor(e) {
   $('#editor').close();
   await saveCourse(course);
   toast(old ? '已更新' : '已新增課程 🌱');
+}
+
+// ---------- 分類管理 ----------
+function fillCategorySelect(selected) {
+  const list = categoryList();
+  const extra = selected && !list.some(c => c.name === selected) ? [{ name: selected, emoji: DEFAULT_EMOJI }] : [];
+  $('#editor-form').category.innerHTML = '<option value="">未分類</option>'
+    + [...list, ...extra].map(c => `<option value="${esc(c.name)}">${esc(c.emoji)} ${esc(c.name)}</option>`).join('')
+    + '<option value="__new">＋ 新增分類…</option>';
+  $('#editor-form').category.value = selected;
+}
+
+const cleanCatName = s => String(s || '').trim().replace(/\s+/g, ' ').slice(0, 20);
+const cleanEmoji = s => [...String(s || '').trim()].slice(0, 2).join('') || DEFAULT_EMOJI;
+
+async function saveCategories(list) {
+  state.settings = { ...state.settings, categories: list };
+  try { await state.store.saveSettings(state.settings); }
+  catch (e) { toast('分類儲存失敗：' + e.message); }
+  render();
+}
+
+// 匯入或新增課程時，遇到清單裡沒有的分類就自動加進去
+async function ensureCategories(names) {
+  const list = categoryList();
+  const missing = [...new Set(names.map(cleanCatName).filter(Boolean))].filter(n => !list.some(c => c.name === n));
+  if (missing.length || !Array.isArray(state.settings.categories)) {
+    await saveCategories([...list, ...missing.map(name => ({ name, emoji: DEFAULT_EMOJI }))]);
+  }
+}
+
+async function addCategory(name, emoji) {
+  name = cleanCatName(name);
+  if (!name) { toast('請輸入分類名稱'); return false; }
+  if (name === '未分類' || name === '__new') { toast('這個名稱不能使用'); return false; }
+  const list = categoryList();
+  if (list.some(c => c.name === name)) { toast(`「${name}」已經存在`); return false; }
+  await saveCategories([...list, { name, emoji: cleanEmoji(emoji) }]);
+  toast(`已新增分類「${name}」`);
+  return name;
+}
+
+async function renameCategory(index, newName) {
+  const list = categoryList().map(c => ({ ...c }));
+  const cat = list[index];
+  if (!cat) return;
+  newName = cleanCatName(newName);
+  if (!newName || newName === cat.name) { renderSettings(); return; }
+  if (newName === '未分類' || list.some(c => c.name === newName)) { toast(`「${newName}」已經存在或不能使用`); renderSettings(); return; }
+  const old = cat.name;
+  cat.name = newName;
+  const now = new Date().toISOString();
+  const changed = state.courses.filter(c => c.category === old).map(c => normalizeCourse({ ...c, category: newName, updatedAt: now }));
+  await saveCategories(list);
+  if (changed.length) await state.store.saveMany(changed);
+  toast(`已改名為「${newName}」${changed.length ? `，${changed.length} 門課程一起更新` : ''}`);
+}
+
+async function setCategoryEmoji(index, emoji) {
+  const list = categoryList().map(c => ({ ...c }));
+  if (!list[index]) return;
+  list[index].emoji = cleanEmoji(emoji);
+  await saveCategories(list);
+}
+
+async function deleteCategory(index) {
+  const list = categoryList().map(c => ({ ...c }));
+  const cat = list[index];
+  if (!cat) return;
+  const used = state.courses.filter(c => c.category === cat.name);
+  const msg = used.length
+    ? `「${cat.name}」目前有 ${used.length} 門課程使用。\n刪除後，這些課程會改成「未分類」。\n\n確定刪除？`
+    : `確定刪除分類「${cat.name}」？`;
+  if (!confirm(msg)) return;
+  list.splice(index, 1);
+  const now = new Date().toISOString();
+  await saveCategories(list);
+  if (used.length) await state.store.saveMany(used.map(c => normalizeCourse({ ...c, category: '', updatedAt: now })));
+  toast(`已刪除分類「${cat.name}」`);
+}
+
+async function moveCategory(index, delta) {
+  const list = categoryList().map(c => ({ ...c }));
+  const to = index + delta;
+  if (to < 0 || to >= list.length) return;
+  [list[index], list[to]] = [list[to], list[index]];
+  await saveCategories(list);
+}
+
+function categoryPanel() {
+  const list = categoryList();
+  const counts = new Map();
+  state.courses.forEach(c => counts.set(c.category || '', (counts.get(c.category || '') || 0) + 1));
+  const unc = counts.get('') || 0;
+  return `
+    <div class="panel">
+      <h2>${icon('grid')}分類管理 <small>共 ${list.length} 個</small></h2>
+      <p class="muted-text">直接修改圖示或名稱就會儲存；改名時，使用這個分類的課程會一起更新。</p>
+      <ul class="cat-list">${list.map((c, i) => `
+        <li class="cat-row" data-i="${i}">
+          <input class="cat-emoji" value="${esc(c.emoji)}" aria-label="${esc(c.name)} 的圖示" autocomplete="off">
+          <input class="cat-name" value="${esc(c.name)}" maxlength="20" aria-label="分類名稱" autocomplete="off">
+          <span class="cat-count">${counts.get(c.name) || 0} 門</span>
+          <div class="cat-actions">
+            <button type="button" class="btn quiet small icon-only" data-action="cat-up" data-i="${i}" aria-label="上移" title="上移" ${i === 0 ? 'disabled' : ''}>▲</button>
+            <button type="button" class="btn quiet small icon-only" data-action="cat-down" data-i="${i}" aria-label="下移" title="下移" ${i === list.length - 1 ? 'disabled' : ''}>▼</button>
+            <button type="button" class="btn quiet small icon-only" data-action="cat-delete" data-i="${i}" aria-label="刪除 ${esc(c.name)}" title="刪除">${icon('trash')}</button>
+          </div>
+        </li>`).join('')}
+      </ul>
+      ${unc ? `<p class="muted-text">未分類：${unc} 門</p>` : ''}
+      <form class="cat-add" id="cat-add">
+        <input name="emoji" class="cat-emoji" placeholder="${DEFAULT_EMOJI}" aria-label="新分類的圖示" autocomplete="off">
+        <input name="name" placeholder="新分類名稱" maxlength="20" aria-label="新分類名稱" autocomplete="off">
+        <button type="submit" class="btn primary small">${icon('plus')}新增</button>
+      </form>
+    </div>`;
 }
 
 boot().catch(e => {
