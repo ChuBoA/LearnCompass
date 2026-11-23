@@ -593,3 +593,22 @@ dialog.viewer::backdrop { background: rgba(18, 14, 12, .6); }
 @media (max-width: 720px) {
   .attach-grid { grid-template-columns: repeat(3, 1fr); gap: 8px; }
 }
+
+/* 手機編輯器：工具列固定在鍵盤正上方 */
+@media (max-width: 720px) {
+  dialog.note-dialog { position: fixed; inset: var(--vv-top, 0px) 0 auto 0; height: var(--vv-h, 100dvh); overflow: hidden; }
+  .note-shell { min-height: 0; }
+  .note-scroll { min-height: 0; overscroll-behavior: contain; padding-bottom: 24px; }
+  .rich { min-height: 32dvh; }
+  .note-shell > .rich-toolbar {
+    position: relative; flex: none; margin: 0; padding: 5px 10px calc(5px + env(safe-area-inset-bottom));
+    border-bottom: 0; background: var(--surface); backdrop-filter: none; -webkit-backdrop-filter: none;
+    touch-action: pan-x; overscroll-behavior-x: contain; -webkit-overflow-scrolling: touch;
+  }
+  .note-dialog.keyboard-open .note-shell > .rich-toolbar { padding-bottom: 5px; }
+  .note-shell > .rich-toolbar button { width: 44px; height: 44px; }
+  .note-shell > .rich-toolbar.has-more {
+    -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 36px), transparent);
+    mask-image: linear-gradient(to right, #000 calc(100% - 36px), transparent);
+  }
+}

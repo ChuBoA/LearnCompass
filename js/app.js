@@ -702,6 +702,7 @@ function bindNoteEditor() {
     onFiles: addFiles
   });
   bindAttachments(dialog);
+  bindPhoneEditor();
   ['#note-title', '#note-tags'].forEach(sel => $(sel).addEventListener('input', markNoteDirty));
   $('#note-course').addEventListener('change', markNoteDirty);
   $('#note-title').addEventListener('keydown', e => {
@@ -738,9 +739,68 @@ function openNote(id, preset = {}) {
   renderAttachments();
   setSaveState(existing ? `上次編輯 ${relTime(existing.updatedAt)}` : '新筆記');
   $('#note-editor').showModal();
+  syncNoteViewport();
   $('#note-editor .note-scroll').scrollTop = 0;
   if (!existing) $('#note-title').focus();
   else $('#note-title').blur();
+}
+
+// ---------- 手機編輯器：工具列固定在鍵盤正上方 ----------
+const phoneLayout = matchMedia('(max-width: 720px)');
+
+// 手機鍵盤跳出時，版面高度不會變，畫面還會被往上推，工具列就跑到看不到的地方。
+// 這裡讓編輯器的位置與高度，永遠貼齊「鍵盤以外實際看得到的範圍」。
+function syncNoteViewport() {
+  const dialog = $('#note-editor');
+  const vv = window.visualViewport;
+  if (!phoneLayout.matches || !vv || !dialog.open) {
+    dialog.style.removeProperty('--vv-top');
+    dialog.style.removeProperty('--vv-h');
+    dialog.classList.remove('keyboard-open');
+    return;
+  }
+  dialog.style.setProperty('--vv-top', `${Math.round(vv.offsetTop)}px`);
+  dialog.style.setProperty('--vv-h', `${Math.round(vv.height)}px`);
+  dialog.classList.toggle('keyboard-open', document.documentElement.clientHeight - vv.height > 120);
+  updateToolbarHint();
+  revealCaret();
+}
+
+// 工具列可以左右滑：右邊還有按鈕時顯示淡出提示
+function updateToolbarHint() {
+  const toolbar = $('#note-toolbar');
+  toolbar.classList.toggle('has-more', toolbar.scrollLeft + toolbar.clientWidth < toolbar.scrollWidth - 4);
+}
+
+// 打字的位置不要被工具列或鍵盤蓋住
+function revealCaret() {
+  const body = $('#note-body');
+  const sel = getSelection();
+  if (document.activeElement !== body || !sel.rangeCount) return;
+  const rect = sel.getRangeAt(0).getBoundingClientRect();
+  if (!rect.top && !rect.bottom) return;
+  const scroller = $('#note-editor .note-scroll');
+  const box = scroller.getBoundingClientRect();
+  if (rect.bottom > box.bottom - 12) scroller.scrollTop += rect.bottom - box.bottom + 12;
+  else if (rect.top < box.top + 12) scroller.scrollTop -= box.top + 12 - rect.top;
+}
+
+function bindPhoneEditor() {
+  const toolbar = $('#note-toolbar');
+  const body = $('#note-body');
+  const scroller = $('#note-editor .note-scroll');
+  const place = () => {
+    if (phoneLayout.matches) scroller.after(toolbar);
+    else scroller.insertBefore(toolbar, body);
+    syncNoteViewport();
+  };
+  toolbar.addEventListener('scroll', updateToolbarHint, { passive: true });
+  phoneLayout.addEventListener('change', place);
+  window.visualViewport?.addEventListener('resize', syncNoteViewport);
+  window.visualViewport?.addEventListener('scroll', syncNoteViewport);
+  $('#note-editor').addEventListener('focusin', syncNoteViewport);
+  body.addEventListener('input', revealCaret);
+  place();
 }
 
 function setSaveState(text) {
