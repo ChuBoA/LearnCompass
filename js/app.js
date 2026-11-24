@@ -11,7 +11,8 @@ import {
 import { normalizeNote, normalizeAttachment, isNoteEmpty, parseTags, setupRichEditor } from './notes.js';
 import {
   CURRENCIES, SUB_CATEGORIES, normalizeSub, isActive, nextCharge, paidCount, rateOf, toTwd, monthlyTwd,
-  cycleLabel, priceText, computeSubAlerts, estimateTwd, chargeTwd, usesActual, chargeHistory, paidSummary, defaultFeePct
+  cycleLabel, priceText, computeSubAlerts, estimateTwd, chargeTwd, usesActual, chargeHistory, paidSummary, defaultFeePct,
+  subStatus, isPaused, periodStats, computeResumeAlerts, validatePeriods
 } from './subs.js';
 import { fetchTwdRates, RATE_REFRESH_MS } from './rates.js';
 import {
@@ -52,6 +53,7 @@ const state = {
   subs: [],
   subFilter: 'active',  // active | month | year | cancelled | all
   editingSubId: null,
+  subPeriods: [],       // 編輯視窗裡的訂閱期間（草稿）
   localPending: new Set(), // 這台裝置還沒上傳到雲端硬碟的附件 id
   uploadingId: null,
   driveError: ''
@@ -302,6 +304,7 @@ function bindEvents() {
       case 'sub-filter': state.subFilter = el.dataset.value; renderSubs(); break;
       case 'update-rates': updateRates(true); break;
       case 'record-charge': recordCharge(el); break;
+      case 'confirm-resume': confirmResume(id); break;
       case 'edit': openEditor(id); break;
       case 'delete': deleteCourse(id); break;
       case 'go': break;
@@ -462,7 +465,7 @@ function render() {
   renderFilters();
   const alerts = computeAlerts(state.courses, state.settings);
   const urgent = alerts.expiring.filter(a => a.daysLeft <= 7).length + alerts.sessions.filter(a => a.daysUntil <= 1).length
-    + computeSubAlerts(state.subs, new Date(), 3).length;
+    + computeSubAlerts(state.subs, new Date(), 3).length + computeResumeAlerts(state.subs, new Date(), 3).length;
   $('#alert-count').hidden = !urgent;
   $('#alert-count').textContent = urgent;
   if (state.tab === 'courses') renderCourses();
@@ -1534,14 +1537,16 @@ async function submitEditor(e) {
 const subNotifyDays = () => (Array.isArray(state.settings.subNotifyDays) ? state.settings.subNotifyDays : DEFAULT_SETTINGS.subNotifyDays);
 const subRates = () => state.settings.rates;
 const whenText = d => (d === 0 ? '今天' : d === 1 ? '明天' : `${d} 天後`);
-const SUB_FILTERS = [['active', '使用中'], ['month', '月繳'], ['year', '年繳'], ['cancelled', '已取消'], ['all', '全部']];
+const SUB_FILTERS = [['active', '使用中'], ['month', '月繳'], ['year', '年繳'], ['paused', '暫停中'], ['cancelled', '已取消'], ['all', '全部']];
+const lastOf = sub => sub.periods[sub.periods.length - 1];
+const fmtMonths = m => (m >= 11.5 ? `${(m / 12).toFixed(m >= 23.5 ? 0 : 1).replace(/\.0$/, '')} 年` : `${Math.max(1, Math.round(m))} 個月`);
+const addDays = (date, n) => new Date(Date.parse(date + 'T00:00:00Z') + n * 86400000).toISOString().slice(0, 10);
 
 function subMatches(sub, filter, today) {
-  const active = isActive(sub, today);
-  if (filter === 'active') return active;
-  if (filter === 'cancelled') return !active;
-  if (filter === 'month') return active && sub.cycle === 'month';
-  if (filter === 'year') return active && sub.cycle === 'year';
+  const status = subStatus(sub, today);
+  if (filter === 'active' || filter === 'paused' || filter === 'cancelled') return status === filter;
+  if (filter === 'month') return status === 'active' && sub.cycle === 'month';
+  if (filter === 'year') return status === 'active' && sub.cycle === 'year';
   return true;
 }
 
@@ -1573,6 +1578,15 @@ function pendingCharges(today) {
   return out.sort((a, b) => b.date.localeCompare(a.date));
 }
 
+async function saveSubQuiet(sub, message) {
+  try {
+    await state.store.saveSub(normalizeSub({ ...sub, updatedAt: new Date().toISOString() }));
+    if (message) toast(message);
+  } catch (e) {
+    toast('儲存失敗：' + e.message);
+  }
+}
+
 async function recordCharge(button) {
   const row = button.closest('[data-charge]');
   const sub = state.subs.find(s => s.id === row.dataset.id);
@@ -1580,27 +1594,53 @@ async function recordCharge(button) {
   if (!sub) return;
   if (!(twd > 0)) { toast('請輸入帳單上的新台幣金額'); row.querySelector('input').focus(); return; }
   const charges = [...sub.charges.filter(c => c.date !== row.dataset.date), { date: row.dataset.date, twd }];
-  try {
-    await state.store.saveSub(normalizeSub({ ...sub, charges, updatedAt: new Date().toISOString() }));
-    toast(`已記錄 ${sub.name} ${fmtDate(row.dataset.date)} 實際扣款 ${money(twd)}`);
-  } catch (e) {
-    toast('儲存失敗：' + e.message);
+  await saveSubQuiet({ ...sub, charges }, `已記錄 ${sub.name} ${fmtDate(row.dataset.date)} 實際扣款 ${money(twd)}`);
+}
+
+// 預計恢復日已過：一鍵記錄「已恢復」
+async function confirmResume(id) {
+  const sub = state.subs.find(s => s.id === id);
+  if (!sub) return;
+  const cur = lastOf(sub);
+  const start = cur.resumeAt || taipeiToday();
+  const periods = [...sub.periods.map(p => ({ ...p })), { start, end: '', endType: '', resumeAt: '', price: cur.price, currency: cur.currency, feePct: cur.feePct }];
+  periods[periods.length - 2].resumeAt = '';
+  await saveSubQuiet({ ...sub, periods }, `已記錄 ${sub.name} 從 ${fmtDate(start)} 恢復訂閱`);
+}
+
+function subSide(sub, today) {
+  const status = subStatus(sub, today);
+  const cur = lastOf(sub);
+  if (status === 'active') {
+    const next = nextCharge(sub, today);
+    if (!next) return '<span class="when muted">—</span>';
+    const days = dayDiff(today, next);
+    const pauseSoon = cur.end && cur.end > today ? `<small>${fmtDate(cur.end)} 起${cur.endType === 'pause' ? '暫停' : '取消'}</small>` : `<small>${fmtDate(next)} 扣款</small>`;
+    return `<span class="when ${days <= 3 ? 'danger' : days <= 7 ? 'warn' : ''}">${whenText(days)}</span>${pauseSoon}`;
   }
+  if (status === 'paused') {
+    if (cur.resumeAt) {
+      const d = dayDiff(today, cur.resumeAt);
+      return `<span class="when paused">⏸ 暫停中</span><small>${d >= 0 ? `預計 ${fmtDate(cur.resumeAt)} 恢復` : `預計恢復日已過 ${-d} 天`}</small>`;
+    }
+    return `<span class="when paused">⏸ 暫停中</span><small>${fmtDate(cur.end)} 起</small>`;
+  }
+  return `<span class="when muted">已取消</span><small>${fmtDate(cur.end)}</small>`;
 }
 
 function subRow(sub, today) {
-  const next = nextCharge(sub, today);
-  const days = next ? dayDiff(today, next) : null;
+  const status = subStatus(sub, today);
   const h = hueOf(sub.category || sub.name);
-  const side = next
-    ? `<span class="when ${days <= 3 ? 'danger' : days <= 7 ? 'warn' : ''}">${whenText(days)}</span><small>${fmtDate(next)} 扣款</small>`
-    : `<span class="when muted">已取消</span><small>${fmtDate(sub.cancelledAt)}</small>`;
+  const stats = periodStats(sub, today, subRates());
+  const extra = [`累計 ${paidCount(sub, today)} 次`];
+  if (stats.pauses) extra.push(`暫停 ${stats.pauses} 次`);
+  if (sub.feePct > 0) extra.push(`手續費 ${sub.feePct}%`);
   return `<li>
-    <button type="button" class="sub-row ${next ? '' : 'cancelled'}" data-action="edit-sub" data-id="${esc(sub.id)}" style="--h:${h}">
+    <button type="button" class="sub-row ${status}" data-action="edit-sub" data-id="${esc(sub.id)}" style="--h:${h}">
       <span class="sub-avatar" aria-hidden="true">${esc([...sub.name][0] || '?')}</span>
-      <span class="sub-main"><strong>${esc(sub.name)}</strong><small>${esc(sub.category || '未分類')}・累計 ${paidCount(sub, today)} 次${sub.feePct > 0 ? `・手續費 ${sub.feePct}%` : ''}</small></span>
+      <span class="sub-main"><strong>${esc(sub.name)}</strong><small>${esc(sub.category || '未分類')}・${extra.join('・')}</small></span>
       <span class="sub-price">${subPriceHtml(sub)}</span>
-      <span class="sub-next">${side}</span>
+      <span class="sub-next">${subSide(sub, today)}</span>
     </button>
   </li>`;
 }
@@ -1613,6 +1653,14 @@ function subBars(groups) {
       <div class="bar-track"><div class="bar" style="width:${(g.monthly / max) * 100}%"></div></div>
       <div class="bar-value">${money(g.monthly)}<small>／月</small></div>
     </div>`).join('')}</div>`;
+}
+
+// 未來 30 天的扣款與預計恢復，合併成一條時間軸
+function upcomingEvents(rates) {
+  const charges = computeSubAlerts(state.subs, new Date(), 30).map(x => ({ ...x, kind: 'charge', amount: chargeTwd(x.sub, rates) }));
+  const resumes = computeResumeAlerts(state.subs, new Date(), 30).filter(x => x.daysUntil >= 0)
+    .map(x => ({ ...x, kind: 'resume', amount: chargeTwd(x.sub, rates) }));
+  return [...charges, ...resumes].sort((a, b) => a.date.localeCompare(b.date));
 }
 
 function renderSubs() {
@@ -1629,17 +1677,20 @@ function renderSubs() {
   }
   const rates = subRates();
   const active = all.filter(s => isActive(s, today));
-  const cancelled = all.length - active.length;
+  const paused = all.filter(s => isPaused(s, today));
+  const cancelled = all.length - active.length - paused.length;
   const monthly = sum(active, s => monthlyTwd(s, rates));
-  const upcoming = computeSubAlerts(all, new Date(), 30);
-  const upcomingTotal = sum(upcoming, x => chargeTwd(x.sub, rates));
-  const soon = upcoming.filter(x => x.daysUntil <= 7).length;
+  const pausedMonthly = sum(paused, s => monthlyTwd(s, rates));
+  const events = upcomingEvents(rates);
+  const upcomingTotal = sum(events, e => e.amount);
+  const soon = events.filter(x => x.daysUntil <= 7).length;
   const paid = all.map(s => paidSummary(s, today, rates));
   const paidTotal = sum(paid, p => p.total);
   const paidCountAll = sum(paid, p => p.count);
   const actualCountAll = sum(paid, p => p.actualCount);
+  const pauseSaved = sum(all, s => periodStats(s, today, rates).saved);
   const pending = pendingCharges(today);
-  const saved = sum(all.filter(s => !isActive(s, today)), s => monthlyTwd(s, rates));
+  const overdue = computeResumeAlerts(all, new Date(), 0).filter(x => x.daysUntil < 0 || x.daysUntil === 0);
 
   const byCat = new Map();
   for (const s of active) {
@@ -1651,27 +1702,38 @@ function renderSubs() {
   }
   const cats = [...byCat.values()].sort((a, b) => b.monthly - a.monthly);
 
+  const order = { active: 0, paused: 1, cancelled: 2 };
   const list = all.filter(s => subMatches(s, state.subFilter, today)).sort((a, b) => {
-    const na = nextCharge(a, today);
-    const nb = nextCharge(b, today);
-    if (na && nb) return na.localeCompare(nb);
-    if (na || nb) return na ? -1 : 1;
-    return (b.cancelledAt || '').localeCompare(a.cancelledAt || '');
+    const sa = subStatus(a, today);
+    const sb = subStatus(b, today);
+    if (sa !== sb) return order[sa] - order[sb];
+    if (sa === 'active') return (nextCharge(a, today) || '').localeCompare(nextCharge(b, today) || '');
+    return (lastOf(b).end || '').localeCompare(lastOf(a).end || '');
   });
 
   view.innerHTML = `
     <div class="stat-tiles">
-      <div class="tile"><small>每月約</small><strong>${money(monthly)}</strong><span>使用中 ${active.length} 項（年繳已平均到每月）</span></div>
-      <div class="tile"><small>每年約</small><strong>${money(monthly * 12)}</strong><span>照目前訂閱持續一整年</span></div>
-      <div class="tile"><small>未來 30 天將扣款</small><strong class="${soon ? 'warn' : ''}">${money(upcomingTotal)}</strong><span>${upcoming.length} 筆${soon ? `・7 天內 ${soon} 筆` : ''}</span></div>
-      <div class="tile"><small>累計已付</small><strong>${money(paidTotal)}</strong><span>${paidCountAll} 期中 ${actualCountAll} 期為實際金額${cancelled ? `・已取消 ${cancelled} 項，每月省 ${money(saved)}` : ''}</span></div>
+      <div class="tile"><small>每月約</small><strong>${money(monthly)}</strong><span>使用中 ${active.length} 項${paused.length ? `・暫停中 ${paused.length} 項，每月少付約 ${money(pausedMonthly)}` : '（年繳已平均到每月）'}</span></div>
+      <div class="tile"><small>每年約</small><strong>${money(monthly * 12)}</strong><span>照目前使用中的訂閱持續一整年</span></div>
+      <div class="tile"><small>未來 30 天將扣款</small><strong class="${soon ? 'warn' : ''}">${money(upcomingTotal)}</strong><span>${events.length} 筆${soon ? `・7 天內 ${soon} 筆` : ''}</span></div>
+      <div class="tile"><small>累計已付</small><strong>${money(paidTotal)}</strong><span>${paidCountAll} 期中 ${actualCountAll} 期為實際金額${pauseSaved >= 1 ? `・暫停期間約省下 ${money(pauseSaved)}` : ''}${cancelled ? `・已取消 ${cancelled} 項` : ''}</span></div>
     </div>
+
+    ${overdue.length ? `<div class="panel pending-panel">
+      <h2>${icon('repeat')}預計恢復日到了 <small>有恢復的話記錄一下，統計才會準確</small></h2>
+      <ul class="charge-pending">${overdue.map(x => `
+        <li>
+          <span class="cp-main"><strong>${esc(x.sub.name)}</strong><small>預計 ${fmtDate(x.date)} 恢復・${priceText(x.sub.price, x.sub.currency)}／${cycleLabel(x.sub)}</small></span>
+          <button type="button" class="btn ghost small" data-action="edit-sub" data-id="${esc(x.sub.id)}">還沒／改日期</button>
+          <button type="button" class="btn primary small" data-action="confirm-resume" data-id="${esc(x.sub.id)}">已恢復</button>
+        </li>`).join('')}</ul>
+    </div>` : ''}
 
     ${pending.length ? `<div class="panel pending-panel">
       <h2>${icon('edit')}最近扣款，填上實際金額 <small>選填・照信用卡帳單（含手續費）</small></h2>
       <ul class="charge-pending">${pending.map(p => `
         <li data-charge data-id="${esc(p.sub.id)}" data-date="${p.date}">
-          <span class="cp-main"><strong>${esc(p.sub.name)}</strong><small>${fmtDate(p.date)} 扣款・${priceText(p.sub.price, p.sub.currency)}・估算 ${money(p.estimate)}</small></span>
+          <span class="cp-main"><strong>${esc(p.sub.name)}</strong><small>${fmtDate(p.date)} 扣款・估算 ${money(p.estimate)}</small></span>
           <label class="cp-input"><span>NT$</span><input type="number" min="0" step="1" inputmode="decimal" placeholder="${Math.round(p.estimate)}" aria-label="${esc(p.sub.name)} 實際扣款金額"></label>
           <button type="button" class="btn primary small" data-action="record-charge">記錄</button>
         </li>`).join('')}</ul>
@@ -1680,17 +1742,18 @@ function renderSubs() {
     <div class="sub-columns">
       <div class="panel">
         <h2>${icon('cal')}即將續訂 <small>未來 30 天</small></h2>
-        ${upcoming.length ? `<ol class="timeline">${upcoming.map(({ sub, date, daysUntil }) => `
-          <li class="${daysUntil <= 3 ? 'danger' : daysUntil <= 7 ? 'warn' : ''}">
+        ${events.length ? `<ol class="timeline">${events.map(({ sub, date, daysUntil, kind, amount }) => `
+          <li class="${kind === 'resume' ? 'resume' : ''} ${daysUntil <= 3 ? 'danger' : daysUntil <= 7 ? 'warn' : ''}">
             <span class="tl-date"><b>${date.slice(5).replace('-', '/')}</b><small>${whenText(daysUntil)}</small></span>
             <button type="button" class="tl-main" data-action="edit-sub" data-id="${esc(sub.id)}">
-              <strong>${esc(sub.name)}</strong><small>${priceText(sub.price, sub.currency)}${needsReconcile(sub) ? ` ≈ ${money(chargeTwd(sub, rates))} ${amountTag(sub)}` : ''}</small>
+              <strong>${kind === 'resume' ? '⏯ ' : ''}${esc(sub.name)}${kind === 'resume' ? '<i class="amt-tag resume">預計恢復</i>' : ''}</strong>
+              <small>${priceText(sub.price, sub.currency)}${needsReconcile(sub) ? ` ≈ ${money(amount)} ${amountTag(sub)}` : ''}</small>
             </button>
           </li>`).join('')}</ol>`
           : '<p class="muted-text">未來 30 天沒有扣款 🎉</p>'}
       </div>
       <div class="panel">
-        <h2>${icon('chart')}依類別 <small>每月花費</small></h2>
+        <h2>${icon('chart')}依類別 <small>每月花費・使用中</small></h2>
         ${cats.length ? subBars(cats) : '<p class="muted-text">目前沒有使用中的訂閱</p>'}
       </div>
     </div>
@@ -1707,21 +1770,25 @@ function renderSubs() {
     </div>`;
 }
 
-// 「提醒」頁最上方：30 天內要扣款的訂閱
+// 「提醒」頁最上方：30 天內要扣款或預計恢復的訂閱
 function subAlertPanel() {
   if (!state.subs.length) return '';
   const rates = subRates();
-  const list = computeSubAlerts(state.subs, new Date(), 30);
+  const list = [
+    ...computeSubAlerts(state.subs, new Date(), 30).map(x => ({ ...x, kind: 'charge' })),
+    ...computeResumeAlerts(state.subs, new Date(), 30).map(x => ({ ...x, kind: 'resume' }))
+  ].sort((a, b) => a.date.localeCompare(b.date));
   return `<div class="panel">
     <h2>${icon('card')}即將扣款的訂閱 <small>未來 30 天</small></h2>
-    ${list.length ? `<ul class="alert-list">${list.map(({ sub, date, daysUntil }) => {
+    ${list.length ? `<ul class="alert-list">${list.map(({ sub, date, daysUntil, kind }) => {
       const link = safeUrl(sub.link);
+      const resume = kind === 'resume';
       return `<li class="alert-item">
         <div class="alert-main">
-          <strong>${esc(sub.name)}</strong>
+          <strong>${resume ? '⏯ ' : ''}${esc(sub.name)}${resume ? '（預計恢復扣款）' : ''}</strong>
           <small>${priceText(sub.price, sub.currency)}／${cycleLabel(sub)}${needsReconcile(sub) ? `・約 ${money(chargeTwd(sub, rates))}（${usesActual(sub) ? '依實際' : `含 ${sub.feePct}% 手續費`}）` : ''}・${esc(sub.category || '未分類')}</small>
         </div>
-        <div class="alert-side"><span class="when ${daysUntil <= 3 ? 'danger' : daysUntil <= 7 ? 'warn' : ''}">${whenText(daysUntil)}</span><small>${fmtDate(date)}</small></div>
+        <div class="alert-side"><span class="when ${daysUntil <= 3 ? 'danger' : daysUntil <= 7 ? 'warn' : ''}">${daysUntil < 0 ? `已過 ${-daysUntil} 天` : whenText(daysUntil)}</span><small>${fmtDate(date)}</small></div>
         <div class="alert-actions">
           ${link ? `<a class="btn dark small" data-action="go" href="${esc(link)}" target="_blank" rel="noopener">管理${icon('arrow')}</a>` : ''}
           <button class="btn soft small icon-only" type="button" data-action="edit-sub" data-id="${esc(sub.id)}" aria-label="編輯">${icon('edit')}</button>
@@ -1731,24 +1798,187 @@ function subAlertPanel() {
   </div>`;
 }
 
+// ---------- 訂閱編輯視窗 ----------
 function bindSubEditor() {
   const form = $('#sub-form');
   form.currency.innerHTML = Object.entries(CURRENCIES).map(([k, c]) => `<option value="${k}">${esc(c.symbol)} ${esc(c.label)}</option>`).join('');
   form.every.innerHTML = Array.from({ length: 12 }, (_, i) => `<option value="${i + 1}">每 ${i + 1}</option>`).join('');
-  form.addEventListener('input', e => { if (!e.target.closest('#sub-charges')) updateSubPreview(); });
+  form.addEventListener('input', e => {
+    if (e.target.closest('#sub-charges')) return;
+    if (e.target.closest('#sub-periods')) collectPeriods();
+    updateSubPreview();
+  });
   form.addEventListener('change', e => {
     if (e.target.closest('#sub-charges')) { updateSubPreview(); return; }
+    if (e.target.closest('#sub-periods')) {
+      collectPeriods();
+      if (e.target.name === 'p-type') {
+        // 改成暫停／取消但還沒填日期：預設今天
+        const p = state.subPeriods[Number(e.target.closest('[data-pi]').dataset.pi)];
+        const today = taipeiToday();
+        if (p.endType && !p.end) p.end = today > p.start ? today : addDays(p.start, 1);
+        renderPeriods();
+      } else renderPeriodBar();
+      renderChargeRows();
+      updateSubPreview();
+      return;
+    }
     // 換幣別時，如果手續費還是預設值，就跟著換成新幣別的預設
     if (e.target === form.currency) {
       const prev = form.currency.dataset.prev || 'TWD';
       if (Number(form.feePct.value) === defaultFeePct(prev) || form.feePct.value === '') form.feePct.value = defaultFeePct(form.currency.value);
       form.currency.dataset.prev = form.currency.value;
     }
-    if (['currency', 'price', 'feePct', 'cycle', 'every', 'startDate', 'cancelledAt'].includes(e.target.name)) renderChargeRows();
+    if (['currency', 'price', 'feePct', 'cycle', 'every'].includes(e.target.name)) { renderPeriods(); renderChargeRows(); }
     updateSubPreview();
+  });
+  $('#sub-period-actions').addEventListener('click', e => {
+    const btn = e.target.closest('[data-pact]');
+    if (btn) periodAction(btn.dataset.pact);
+  });
+  $('#sub-periods').addEventListener('click', e => {
+    const btn = e.target.closest('[data-premove]');
+    if (!btn) return;
+    collectPeriods();
+    const i = Number(btn.dataset.premove);
+    if (state.subPeriods.length <= 1 || !confirm(`刪除第 ${i + 1} 段期間？`)) return;
+    state.subPeriods.splice(i, 1);
+    refreshPeriodsUi();
   });
   form.addEventListener('submit', submitSubEditor);
   $('#sub-delete').addEventListener('click', deleteCurrentSub);
+}
+
+// 目前這段的價格、幣別、手續費以上方欄位為準
+function mainPricing() {
+  const form = $('#sub-form');
+  return { price: form.price.value, currency: form.currency.value, feePct: form.feePct.value };
+}
+
+// 從畫面讀回期間（存在 state.subPeriods）
+function collectPeriods() {
+  const rows = $$('#sub-periods [data-pi]');
+  rows.forEach(row => {
+    const p = state.subPeriods[Number(row.dataset.pi)];
+    if (!p) return;
+    const type = row.querySelector('[name=p-type]').value;
+    p.start = row.querySelector('[name=p-start]').value;
+    p.endType = type === 'active' ? '' : type;
+    p.end = type === 'active' ? '' : (row.querySelector('[name=p-end]')?.value || '');
+    p.resumeAt = type === 'pause' ? (row.querySelector('[name=p-resume]')?.value || '') : '';
+    const price = row.querySelector('[name=p-price]');
+    if (price) p.price = price.value;
+  });
+  return state.subPeriods;
+}
+
+function draftPeriods() {
+  const list = state.subPeriods.map(p => ({ ...p }));
+  if (list.length) Object.assign(list[list.length - 1], mainPricing());
+  return list;
+}
+
+function refreshPeriodsUi() {
+  renderPeriods();
+  renderChargeRows();
+  updateSubPreview();
+}
+
+function renderPeriods() {
+  const box = $('#sub-periods');
+  const list = state.subPeriods;
+  const many = list.length > 1;
+  $('#sub-periods-hint').textContent = many ? '每段各自從開始日推算扣款日；最後一段的金額以上方「目前金額」為準' : '第一次扣款日：免費試用請填試用結束、開始扣款那天';
+  box.innerHTML = list.map((p, i) => {
+    const last = i === list.length - 1;
+    const type = p.endType || 'active';
+    const sym = (CURRENCIES[p.currency] || CURRENCIES.TWD).symbol;
+    return `<li class="period-row ${type}" data-pi="${i}">
+      <div class="pr-head">
+        <b>${many ? `第 ${i + 1} 段` : '目前這段'}</b>
+        <select name="p-type" aria-label="狀態">
+          ${last ? `<option value="active" ${type === 'active' ? 'selected' : ''}>使用中</option>` : ''}
+          <option value="pause" ${type === 'pause' ? 'selected' : ''}>暫停</option>
+          <option value="cancel" ${type === 'cancel' ? 'selected' : ''}>取消</option>
+        </select>
+        ${many ? `<button type="button" class="btn quiet small icon-only" data-premove="${i}" aria-label="刪除第 ${i + 1} 段" title="刪除這段">${icon('trash')}</button>` : ''}
+      </div>
+      <div class="pr-fields">
+        <label><span>${i === 0 ? '第一次扣款日' : '恢復（開始扣款）日'}</span><input type="date" name="p-start" value="${esc(p.start)}" required></label>
+        ${type !== 'active' ? `<label><span>${type === 'pause' ? '暫停日' : '取消日'}<small>這天起不再扣款</small></span><input type="date" name="p-end" value="${esc(p.end)}" required></label>` : ''}
+        ${type === 'pause' && last ? `<label><span>預計恢復日<small>選填</small></span><input type="date" name="p-resume" value="${esc(p.resumeAt)}"></label>` : ''}
+        ${last ? '' : `<label><span>這段的金額</span><span class="money-mini"><em>${esc(sym)}</em><input type="number" name="p-price" min="0" step="0.01" inputmode="decimal" value="${esc(p.price)}"></span></label>`}
+      </div>
+    </li>`;
+  }).join('');
+  renderPeriodActions();
+  renderPeriodBar();
+}
+
+function renderPeriodActions() {
+  const last = state.subPeriods[state.subPeriods.length - 1];
+  const box = $('#sub-period-actions');
+  if (!last) { box.innerHTML = ''; return; }
+  const today = taipeiToday();
+  let buttons;
+  if (!last.endType) {
+    buttons = `<button type="button" class="btn ghost small" data-pact="pause">⏸ 暫停訂閱</button>
+      <button type="button" class="btn ghost small" data-pact="cancel">取消訂閱</button>`;
+  } else if (last.endType === 'pause') {
+    buttons = `<button type="button" class="btn primary small" data-pact="resume">⏯ 恢復訂閱</button>
+      <button type="button" class="btn ghost small" data-pact="to-cancel">改成取消</button>`;
+  } else {
+    buttons = `<button type="button" class="btn primary small" data-pact="resume">${icon('repeat')}重新訂閱</button>`;
+  }
+  box.innerHTML = buttons + (last.end && last.end > today ? `<small class="muted-text">${fmtDate(last.end)} 起${last.endType === 'pause' ? '暫停' : '取消'}，在那之前仍會扣款</small>` : '');
+}
+
+function periodAction(kind) {
+  collectPeriods();
+  const list = state.subPeriods;
+  const last = list[list.length - 1];
+  const today = taipeiToday();
+  if (kind === 'pause' || kind === 'cancel') {
+    last.endType = kind;
+    last.end = today > last.start ? today : addDays(last.start, 1);
+    last.resumeAt = '';
+  } else if (kind === 'to-cancel') {
+    last.endType = 'cancel';
+    last.resumeAt = '';
+  } else if (kind === 'resume') {
+    let start = last.resumeAt && last.resumeAt >= last.end ? last.resumeAt : today;
+    if (last.end && start < last.end) start = last.end;
+    last.resumeAt = '';
+    // 上一段改用自己的價格保存，新的一段沿用目前金額
+    Object.assign(last, mainPricing());
+    list.push({ start, end: '', endType: '', resumeAt: '', ...mainPricing() });
+  }
+  refreshPeriodsUi();
+  const focusName = kind === 'resume' ? 'p-start' : 'p-end';
+  $(`#sub-periods [data-pi="${list.length - 1}"] [name=${focusName}]`)?.focus();
+  toast({ pause: '已設為暫停，請確認暫停日；可選填預計恢復日', cancel: '已設為取消，請確認取消日', resume: '已新增一段期間，請確認恢復日與目前金額', 'to-cancel': '已改成取消' }[kind]);
+}
+
+// 期間橫條：有訂閱的時段上色，暫停斜線，取消灰色
+function renderPeriodBar() {
+  const bar = $('#sub-period-bar');
+  const list = state.subPeriods.filter(p => /^\d{4}-\d{2}-\d{2}$/.test(p.start)).sort((a, b) => a.start.localeCompare(b.start));
+  if (!list.length) { bar.hidden = true; return; }
+  const today = taipeiToday();
+  const from = list[0].start;
+  const lastP = list[list.length - 1];
+  const to = [today, lastP.end, lastP.resumeAt].filter(Boolean).sort().pop();
+  const total = Math.max(1, dayDiff(from, to));
+  const segs = [];
+  list.forEach((p, i) => {
+    const end = p.end || to;
+    segs.push({ cls: 'on', from: p.start, to: end });
+    const next = list[i + 1];
+    if (p.end) segs.push({ cls: p.endType === 'pause' ? 'pause' : 'off', from: p.end, to: next ? next.start : to });
+  });
+  bar.hidden = list.length < 2 && !lastP.end;
+  bar.innerHTML = `<div class="pb-track">${segs.filter(s => s.to > s.from).map(s => `<span class="pb-seg ${s.cls}" style="left:${dayDiff(from, s.from) / total * 100}%;width:${dayDiff(s.from, s.to) / total * 100}%" title="${fmtDate(s.from)} – ${fmtDate(s.to)}"></span>`).join('')}</div>
+    <div class="pb-labels"><span>${fmtDate(from)}</span><span class="pb-legend"><i class="on"></i>訂閱 <i class="pause"></i>暫停 <i class="off"></i>取消</span><span>${fmtDate(to)}</span></div>`;
 }
 
 function subFromForm() {
@@ -1756,10 +1986,9 @@ function subFromForm() {
   const old = state.subs.find(s => s.id === state.editingSubId);
   return normalizeSub({
     ...(old || {}),
-    name: form.name.value, category: form.category.value, price: form.price.value, currency: form.currency.value,
-    cycle: form.cycle.value, every: form.every.value, startDate: form.startDate.value,
-    cancelledAt: form.cancelledAt.value, link: form.link.value, note: form.note.value,
-    feePct: form.feePct.value, charges: chargesFromForm(old),
+    name: form.name.value, category: form.category.value, ...mainPricing(),
+    cycle: form.cycle.value, every: form.every.value, link: form.link.value, note: form.note.value,
+    periods: draftPeriods(), charges: chargesFromForm(old),
     updatedAt: new Date().toISOString()
   });
 }
@@ -1771,23 +2000,20 @@ function chargesFromForm(old) {
   return [...kept, ...[...shown].filter(([, twd]) => twd > 0).map(([date, twd]) => ({ date, twd }))];
 }
 
+const formReady = () => $('#sub-form').price.value !== '' && state.subPeriods.some(p => p.start);
+
 // 編輯視窗：列出最近 12 期，可以填實際扣款金額
 function renderChargeRows() {
-  const form = $('#sub-form');
   const box = $('#sub-charges');
   const typed = new Map($$('#sub-charges [data-date]').map(li => [li.dataset.date, li.querySelector('input').value]));
-  if (!form.startDate.value || !form.price.value) { $('#sub-charges-field').hidden = true; box.innerHTML = ''; return; }
-  const old = state.subs.find(s => s.id === state.editingSubId);
-  const sub = normalizeSub({
-    ...(old || {}), price: form.price.value, currency: form.currency.value, feePct: form.feePct.value,
-    cycle: form.cycle.value, every: form.every.value, startDate: form.startDate.value, cancelledAt: form.cancelledAt.value
-  });
+  if (!formReady() || validatePeriods(draftPeriods())) { $('#sub-charges-field').hidden = true; box.innerHTML = ''; return; }
+  const sub = subFromForm();
   const hist = chargeHistory(sub, taipeiToday(), subRates()).slice(-12).reverse();
   $('#sub-charges-field').hidden = !hist.length;
   box.innerHTML = hist.map(h => {
     const value = typed.has(h.date) ? typed.get(h.date) : (h.actual ?? '');
     return `<li data-date="${h.date}">
-      <span class="cl-date">${fmtDate(h.date)}</span>
+      <span class="cl-date">${fmtDate(h.date)}${sub.periods.length > 1 ? `<small>第 ${h.period + 1} 段</small>` : ''}</span>
       <span class="cl-est">估算 ${money(h.estimate)}</span>
       <label class="cp-input"><span>NT$</span><input type="number" min="0" step="1" inputmode="decimal" value="${esc(value)}" placeholder="實際金額" aria-label="${fmtDate(h.date)} 實際扣款"></label>
     </li>`;
@@ -1795,22 +2021,38 @@ function renderChargeRows() {
 }
 
 function updateSubPreview() {
-  const form = $('#sub-form');
-  if (!form.startDate.value || !form.price.value) { $('#sub-preview').textContent = ''; return; }
+  const preview = $('#sub-preview');
+  if (!formReady()) { preview.textContent = ''; return; }
+  const problem = validatePeriods(draftPeriods());
+  if (problem) { preview.textContent = '⚠️ ' + problem; preview.classList.add('error'); return; }
+  preview.classList.remove('error');
   const sub = subFromForm();
   const today = taipeiToday();
+  const rates = subRates();
+  const status = subStatus(sub, today);
   const next = nextCharge(sub, today);
-  const paid = paidSummary(sub, today, subRates());
+  const paid = paidSummary(sub, today, rates);
+  const st = periodStats(sub, today, rates);
   const parts = [];
   if (needsReconcile(sub)) {
     parts.push(usesActual(sub)
-      ? `每期約 ${money(chargeTwd(sub, subRates()))}（最近 ${Math.min(3, sub.charges.length)} 次實際平均）`
-      : `每期估算 ${money(estimateTwd(sub, subRates()))}（${priceText(sub.price, sub.currency)} × 匯率 ${rateOf(sub.currency, subRates())} × ${(1 + sub.feePct / 100).toFixed(3).replace(/0+$/, '')}）`);
+      ? `每期約 ${money(chargeTwd(sub, rates))}（最近 ${Math.min(3, sub.charges.filter(c => c.date >= lastOf(sub).start).length)} 次實際平均）`
+      : `每期估算 ${money(estimateTwd(sub, rates))}（${priceText(sub.price, sub.currency)} × 匯率 ${rateOf(sub.currency, rates)} × ${(1 + sub.feePct / 100).toFixed(3).replace(/0+$/, '')}）`);
   }
-  parts.push(`每月約 ${money(monthlyTwd(sub, subRates()))}`);
-  parts.push(next ? `下次扣款 ${fmtDate(next)}（${whenText(dayDiff(today, next))}）` : '已取消，不會再扣款');
+  if (status === 'active') {
+    parts.push(`每月約 ${money(monthlyTwd(sub, rates))}`);
+    parts.push(next ? `下次扣款 ${fmtDate(next)}（${whenText(dayDiff(today, next))}）` : '之後不會再扣款');
+  } else if (status === 'paused') {
+    const cur = lastOf(sub);
+    parts.push(cur.resumeAt ? `暫停中，預計 ${fmtDate(cur.resumeAt)} 恢復` : '暫停中，不會扣款');
+  } else {
+    parts.push('已取消，不會再扣款');
+  }
   if (paid.count) parts.push(`至今已扣 ${paid.count} 次，共約 ${money(paid.total)}${paid.actualCount ? `（其中 ${paid.actualCount} 次為實際金額）` : ''}`);
-  $('#sub-preview').textContent = parts.join('・');
+  if (st.periods > 1 || st.pauses) {
+    parts.push(`共訂閱 ${fmtMonths(st.activeMonths)}${st.pauses ? `、暫停 ${st.pauses} 次（共 ${fmtMonths(st.pausedMonths)}）` : ''}${st.saved >= 1 ? `，暫停期間約省下 ${money(st.saved)}` : ''}`);
+  }
+  preview.textContent = parts.join('・');
 }
 
 function openSubEditor(id) {
@@ -1818,24 +2060,29 @@ function openSubEditor(id) {
   state.editingSubId = sub ? sub.id : null;
   const form = $('#sub-form');
   form.reset();
-  const s = sub || { currency: 'TWD', cycle: 'month', every: 1, startDate: taipeiToday() };
-  for (const key of ['name', 'category', 'price', 'currency', 'cycle', 'every', 'startDate', 'cancelledAt', 'link', 'note']) {
+  const s = sub || { currency: 'TWD', cycle: 'month', every: 1 };
+  for (const key of ['name', 'category', 'price', 'currency', 'cycle', 'every', 'link', 'note']) {
     form[key].value = s[key] ?? '';
   }
   form.feePct.value = sub ? sub.feePct : defaultFeePct(s.currency);
   form.currency.dataset.prev = s.currency;
-  $('#sub-charges').innerHTML = '';
-  renderChargeRows();
+  state.subPeriods = sub
+    ? sub.periods.map(p => ({ ...p }))
+    : [{ start: taipeiToday(), end: '', endType: '', resumeAt: '', price: '', currency: 'TWD', feePct: 0 }];
   const used = state.subs.map(x => x.category).filter(Boolean);
   $('#dl-sub-category').innerHTML = [...new Set([...SUB_CATEGORIES, ...used])].map(v => `<option value="${esc(v)}">`).join('');
   $('#sub-title').textContent = sub ? '編輯訂閱' : '新增訂閱';
   $('#sub-delete').hidden = !sub;
-  updateSubPreview();
+  $('#sub-charges').innerHTML = '';
+  refreshPeriodsUi();
   $('#sub-editor').showModal();
 }
 
 async function submitSubEditor(e) {
   e.preventDefault();
+  collectPeriods();
+  const problem = validatePeriods(draftPeriods());
+  if (problem) { toast(problem); return; }
   const sub = subFromForm();
   const isNew = !state.editingSubId;
   $('#sub-editor').close();
@@ -1850,7 +2097,7 @@ async function submitSubEditor(e) {
 async function deleteCurrentSub() {
   const sub = state.subs.find(s => s.id === state.editingSubId);
   if (!sub) return;
-  if (!confirm(`確定要刪除「${sub.name}」嗎？\n刪除後累計已付的紀錄也會消失。\n如果只是不再續訂，建議改填「取消日期」保留紀錄。`)) return;
+  if (!confirm(`確定要刪除「${sub.name}」嗎？\n刪除後累計已付的紀錄也會消失。\n如果只是不再續訂，建議按「取消訂閱」保留紀錄。`)) return;
   $('#sub-editor').close();
   await state.store.removeSub(sub.id);
   toast('已刪除訂閱');

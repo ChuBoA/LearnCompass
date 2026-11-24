@@ -218,7 +218,7 @@
       <div class="dlg-body">
         <label class="field full">名稱<input name="name" required maxlength="100" placeholder="例如：ChatGPT Plus、Canva Pro"></label>
         <label class="field">類別<input name="category" list="dl-sub-category" maxlength="30"></label>
-        <label class="field">金額
+        <label class="field">目前金額
           <span class="money-input">
             <select name="currency" aria-label="幣別"></select>
             <input name="price" type="number" min="0" step="0.01" inputmode="decimal" required aria-label="金額">
@@ -233,7 +233,12 @@
         <label class="field">國外交易手續費<small>台灣信用卡多為 1.5%，新台幣扣款通常是 0</small>
           <span class="pct-input"><input name="feePct" type="number" min="0" max="20" step="0.1" inputmode="decimal"><span>%</span></span>
         </label>
-        <label class="field">第一次扣款日<small>免費試用請填試用結束、開始扣款那天</small><input name="startDate" type="date" required></label>
+        <div class="field full">
+          <span>訂閱期間 <small id="sub-periods-hint">第一次扣款日：免費試用請填試用結束、開始扣款那天</small></span>
+          <div class="period-bar" id="sub-period-bar" hidden></div>
+          <ol class="period-list" id="sub-periods"></ol>
+          <div class="period-actions" id="sub-period-actions"></div>
+        </div>
         <p class="field full sub-preview" id="sub-preview"></p>
         <div class="field full" id="sub-charges-field" hidden>
           <span>實際扣款紀錄 <small>選填・照信用卡帳單填新台幣金額（含手續費），之後的預估會改用最近 3 次的平均</small></span>
@@ -241,7 +246,6 @@
         </div>
         <label class="field full">管理訂閱的網址<small>方便要取消時直接前往</small><input name="link" type="url" inputmode="url" placeholder="https://"></label>
         <label class="field full">備註<textarea name="note" rows="3" placeholder="付款方式、帳號、共用的人…"></textarea></label>
-        <label class="field">取消日期<small>已取消才填，這天以後不再扣款</small><input name="cancelledAt" type="date"></label>
       </div>
       <footer class="dlg-foot">
         <button type="button" class="btn danger" id="sub-delete">刪除</button>
