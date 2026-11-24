@@ -693,3 +693,40 @@ dialog.viewer::backdrop { background: rgba(18, 14, 12, .6); }
   #view-subs .tile strong { font-size: 20px; }
   #view-subs .tile span { font-size: 12px; }
 }
+/* 訂閱：手續費與實際扣款 */
+.amt-tag { display: inline-block; margin-left: 4px; padding: 0 6px; border-radius: 99px; font-style: normal; font-size: 10.5px; font-weight: 700; line-height: 17px; vertical-align: 1px; background: color-mix(in srgb, var(--muted) 16%, transparent); color: var(--muted); }
+.amt-tag.actual { background: color-mix(in srgb, var(--sage) 18%, transparent); color: var(--sage); }
+.pct-input { position: relative; display: block; }
+.pct-input input { padding-right: 34px !important; }
+.pct-input span { position: absolute; right: 12px; top: 50%; transform: translateY(-50%); color: var(--muted); font-weight: 600; pointer-events: none; }
+.cp-input { display: inline-flex; align-items: center; gap: 6px; padding: 0 10px; min-height: 40px; border-radius: 12px; border: 1px solid var(--line); background: var(--surface-2); font-size: 13px; color: var(--muted); font-weight: 600; }
+.cp-input:focus-within { outline: 3px solid color-mix(in srgb, var(--accent) 30%, transparent); border-color: var(--accent); background: var(--surface); }
+.cp-input input { width: 92px; min-height: 0 !important; padding: 0 !important; border: 0 !important; outline: none !important; background: transparent !important; font: inherit; color: var(--ink); text-align: right; }
+.pending-panel { border-color: color-mix(in srgb, var(--warn) 35%, var(--line)); }
+.charge-pending { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+.charge-pending li { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 10px; align-items: center; padding: 10px 12px; border-radius: 14px; background: var(--surface-2); }
+.cp-main { display: grid; gap: 2px; min-width: 0; }
+.cp-main strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cp-main small { color: var(--muted); font-size: 12px; }
+.charge-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; max-height: 300px; overflow-y: auto; }
+.charge-list li { display: grid; grid-template-columns: 96px minmax(0, 1fr) auto; gap: 10px; align-items: center; font-weight: 400; }
+.cl-date { font-variant-numeric: tabular-nums; font-weight: 600; }
+.cl-est { color: var(--muted); font-size: 13px; }
+.rate-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; border: 0; padding: 0; margin: 0 0 8px; }
+.rate-field input[readonly] { background: transparent; border-style: dashed; color: var(--muted); }
+@media (max-width: 720px) {
+  .charge-pending li { grid-template-columns: minmax(0, 1fr) auto; }
+  .charge-pending .cp-main { grid-column: 1 / -1; }
+  .charge-pending .cp-input { justify-self: stretch; }
+  .charge-pending .cp-input input { width: 100%; }
+  .charge-list li { grid-template-columns: 84px minmax(0, 1fr) auto; gap: 8px; }
+  .cp-input input { width: 76px; }
+}.field .cp-input input, .cp-input input { width: 92px; }
+@media (max-width: 720px) {
+  .charge-list li { grid-template-columns: minmax(0, 1fr) auto; row-gap: 0; }
+  .charge-list .cl-date { grid-column: 1; grid-row: 1; }
+  .charge-list .cl-est { grid-column: 1; grid-row: 2; font-size: 12px; }
+  .charge-list .cp-input { grid-column: 2; grid-row: 1 / 3; }
+  .field .cp-input input, .cp-input input { width: 84px; }
+  .charge-pending .cp-input input { width: 100%; }
+}

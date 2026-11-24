@@ -25,12 +25,20 @@ const isDate = s => /^\d{4}-\d{2}-\d{2}$/.test(s || '');
 export function normalizeSub(s) {
   const now = new Date().toISOString();
   const cycle = s.cycle === 'year' ? 'year' : 'month';
+  const currency = CURRENCIES[s.currency] ? s.currency : 'TWD';
+  const fee = Number(s.feePct);
   return {
     id: s.id || newSubId(),
     name: String(s.name || '').trim().slice(0, 100) || '未命名訂閱',
     category: String(s.category || '').trim().slice(0, 30),
     price: Math.max(0, Math.round((Number(s.price) || 0) * 100) / 100),
-    currency: CURRENCIES[s.currency] ? s.currency : 'TWD',
+    currency,
+    // 國外交易手續費（%）：外幣預設 1.5%，新台幣預設 0%
+    feePct: s.feePct === undefined || s.feePct === '' || !Number.isFinite(fee)
+      ? defaultFeePct(currency)
+      : Math.min(20, Math.max(0, Math.round(fee * 100) / 100)),
+    // 實際扣款紀錄：[{ date: 扣款日 YYYY-MM-DD, twd: 帳單上的新台幣金額 }]
+    charges: normalizeCharges(s.charges),
     cycle,
     every: Math.min(cycle === 'month' ? 36 : 10, Math.max(1, Math.round(Number(s.every) || 1))),
     startDate: isDate(s.startDate) ? s.startDate : taipeiToday(),
@@ -40,6 +48,18 @@ export function normalizeSub(s) {
     createdAt: s.createdAt || now,
     updatedAt: s.updatedAt || now
   };
+}
+
+export const defaultFeePct = currency => (currency === 'TWD' ? 0 : 1.5);
+
+function normalizeCharges(list) {
+  if (!Array.isArray(list)) return [];
+  const byDate = new Map();
+  for (const c of list) {
+    const twd = Math.round((Number(c?.twd) || 0) * 100) / 100;
+    if (isDate(c?.date) && twd > 0) byDate.set(c.date, { date: c.date, twd });
+  }
+  return [...byDate.values()].sort((a, b) => a.date.localeCompare(b.date)).slice(-240);
 }
 
 export const isActive = (sub, today) => !sub.cancelledAt || sub.cancelledAt > today;
@@ -87,9 +107,42 @@ export function rateOf(currency, rates = DEFAULT_RATES) {
 
 export const toTwd = (amount, currency, rates) => amount * rateOf(currency, rates);
 
-// 換算成每月、每年的新台幣
+// 估算一期扣款：外幣金額 × 匯率 × (1 + 手續費%)
+export const estimateTwd = (sub, rates) => toTwd(sub.price, sub.currency, rates) * (1 + (sub.feePct || 0) / 100);
+
+// 預估下一期：填過實際金額就用最近 3 次的平均（自然反映匯率與手續費），否則用估算
+export function chargeTwd(sub, rates) {
+  const recent = (sub.charges || []).slice(-3);
+  if (recent.length) return recent.reduce((t, c) => t + c.twd, 0) / recent.length;
+  return estimateTwd(sub, rates);
+}
+export const usesActual = sub => (sub.charges || []).length > 0;
+
+// 換算成每月的新台幣
 export function monthlyTwd(sub, rates) {
-  return toTwd(sub.price, sub.currency, rates) / monthsPerCharge(sub);
+  return chargeTwd(sub, rates) / monthsPerCharge(sub);
+}
+
+// 到今天為止的每一期：有實際金額用實際，沒有用估算
+export function chargeHistory(sub, today = taipeiToday(), rates) {
+  const actual = new Map((sub.charges || []).map(c => [c.date, c.twd]));
+  const est = estimateTwd(sub, rates);
+  const n = paidCount(sub, today);
+  const list = [];
+  for (let k = 0; k < n; k++) {
+    const date = chargeDate(sub, k);
+    list.push({ date, estimate: est, actual: actual.has(date) ? actual.get(date) : null });
+  }
+  return list;
+}
+
+export function paidSummary(sub, today, rates) {
+  const hist = chargeHistory(sub, today, rates);
+  return {
+    count: hist.length,
+    actualCount: hist.filter(h => h.actual !== null).length,
+    total: hist.reduce((t, h) => t + (h.actual ?? h.estimate), 0)
+  };
 }
 
 export function cycleLabel(sub) {
@@ -123,7 +176,7 @@ export function computeSubPushMessages(subs, settings = {}, now = new Date()) {
   return computeSubAlerts(subs, now, 60)
     .filter(({ daysUntil }) => days.includes(daysUntil))
     .map(({ sub, date, daysUntil }) => {
-      const twd = sub.currency === 'TWD' ? '' : `（約 NT$ ${Math.round(toTwd(sub.price, sub.currency, settings.rates)).toLocaleString('en-US')}）`;
+      const twd = sub.currency === 'TWD' && !sub.feePct && !usesActual(sub) ? '' : `（約 NT$ ${Math.round(chargeTwd(sub, settings.rates)).toLocaleString('en-US')}）`;
       return {
         tag: `sub-${sub.id}-${date}`,
         title: daysUntil === 0 ? '💳 今天會扣款' : `💳 ${daysUntil} 天後續訂`,

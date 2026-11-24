@@ -6,7 +6,9 @@ export const DEFAULT_SETTINGS = {
   staleDigestWeekday: 1,              // 每週哪天推播久未學習摘要（0=週日）
   sessionNotify: true,                // 上課當天與前一天推播
   subNotifyDays: [3, 0],              // 訂閱扣款前第幾天推播
-  rates: { USD: 32.5, EUR: 35, JPY: 0.21, CNY: 4.5, HKD: 4.2 } // 1 單位外幣 = 幾元新台幣
+  rates: { USD: 32.5, EUR: 35, JPY: 0.21, CNY: 4.5, HKD: 4.2 }, // 1 單位外幣 = 幾元新台幣
+  ratesAuto: true,                    // 自動更新匯率
+  ratesUpdatedAt: ''                  // 上次自動更新時間（ISO）
 };
 
 const WEEKDAYS = ['日', '一', '二', '三', '四', '五', '六'];

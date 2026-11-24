@@ -11,8 +11,9 @@ import {
 import { normalizeNote, normalizeAttachment, isNoteEmpty, parseTags, setupRichEditor } from './notes.js';
 import {
   CURRENCIES, SUB_CATEGORIES, normalizeSub, isActive, nextCharge, paidCount, rateOf, toTwd, monthlyTwd,
-  cycleLabel, priceText, computeSubAlerts
+  cycleLabel, priceText, computeSubAlerts, estimateTwd, chargeTwd, usesActual, chargeHistory, paidSummary, defaultFeePct
 } from './subs.js';
+import { fetchTwdRates, RATE_REFRESH_MS } from './rates.js';
 import {
   MAX_FILE_BYTES, MAX_ATTACHMENTS, NeedAuthError, driveConfigured, driveConnected, driveTokenExpiry,
   setDriveAccount, preloadDrive, connectDrive, disconnectDrive, processQueue, prepareImage,
@@ -128,6 +129,7 @@ async function boot() {
       updateScreens();
       if (user) {
         state.settings = await state.store.getSettings().catch(() => ({ ...DEFAULT_SETTINGS }));
+        updateRates(false);
         render();
       }
     },
@@ -153,7 +155,11 @@ async function boot() {
   switchTab(state.tab);
   preloadDrive()?.catch(() => {});
   addEventListener('online', () => syncDrive(false));
-  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') syncDrive(false); });
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'visible') return;
+    syncDrive(false);
+    if (state.user) updateRates(false);
+  });
 }
 
 // 依狀態決定顯示：密碼鎖 > 登入 > 主畫面
@@ -294,6 +300,8 @@ function bindEvents() {
       case 'new': if (state.tab === 'subs') openSubEditor(null); else openEditor(null); break;
       case 'edit-sub': openSubEditor(id); break;
       case 'sub-filter': state.subFilter = el.dataset.value; renderSubs(); break;
+      case 'update-rates': updateRates(true); break;
+      case 'record-charge': recordCharge(el); break;
       case 'edit': openEditor(id); break;
       case 'delete': deleteCourse(id); break;
       case 'go': break;
@@ -1379,10 +1387,16 @@ function renderSettings() {
 
     <div class="panel">
       <h2>${icon('card')}外幣匯率 <small>訂閱統計換算成新台幣用</small></h2>
-      <p class="muted-text">1 單位外幣等於多少新台幣。匯率不會自動更新，偶爾對照銀行或信用卡帳單調整即可。</p>
+      <div class="rate-head" data-setting>
+        <label class="chip"><input type="checkbox" name="ratesAuto" ${state.settings.ratesAuto !== false ? 'checked' : ''}><span>自動更新匯率</span></label>
+        <button class="btn ghost small" type="button" data-action="update-rates">${icon('repeat')}立即更新</button>
+      </div>
+      <p class="muted-text">${state.settings.ratesAuto !== false
+        ? `每 12 小時自動抓一次最新匯率${state.settings.ratesUpdatedAt ? `，上次更新：${new Intl.DateTimeFormat('zh-TW', { timeZone: 'Asia/Taipei', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).format(new Date(state.settings.ratesUpdatedAt))}${state.settings.ratesSource ? `（${esc(state.settings.ratesSource)}）` : ''}` : '（尚未更新）'}。這是市場匯率，銀行入帳匯率會略有不同，所以搭配手續費％估算；想要精準可在訂閱裡填實際扣款金額。`
+        : '已改為手動：1 單位外幣等於多少新台幣，自己對照銀行或信用卡帳單調整。'}</p>
       <div class="rate-grid" data-setting>${Object.entries(CURRENCIES).filter(([k]) => k !== 'TWD').map(([k, c]) => `
         <label class="rate-field"><span>1 ${esc(c.label)}（${esc(c.symbol)}）=</span>
-          <input type="number" name="rate-${k}" min="0" step="0.0001" inputmode="decimal" value="${rateOf(k, state.settings.rates)}"><span>NT$</span></label>`).join('')}
+          <input type="number" name="rate-${k}" min="0" step="0.0001" inputmode="decimal" value="${rateOf(k, state.settings.rates)}" ${state.settings.ratesAuto !== false ? 'readonly' : ''}><span>NT$</span></label>`).join('')}
       </div>
     </div>
 
@@ -1408,11 +1422,37 @@ async function saveSettingsFromForm() {
     rates: Object.fromEntries(Object.keys(CURRENCIES).filter(k => k !== 'TWD').map(k => {
       const v = Number(root.querySelector(`[name=rate-${k}]`)?.value);
       return [k, v > 0 ? v : rateOf(k, state.settings.rates)];
-    }))
+    })),
+    ratesAuto: !!root.querySelector('[name=ratesAuto]')?.checked
   };
+  const turnedOn = s.ratesAuto && state.settings.ratesAuto === false;
+  const autoChanged = s.ratesAuto !== (state.settings.ratesAuto !== false);
   state.settings = { ...state.settings, ...s };
   try { await state.store.saveSettings(state.settings); toast('設定已儲存'); }
   catch (e) { toast('儲存失敗：' + e.message); }
+  if (autoChanged) renderSettings();
+  if (turnedOn) updateRates(true);
+}
+
+// 自動更新匯率（每 12 小時一次；force = 使用者按「立即更新」）
+let ratesBusy = false;
+async function updateRates(force) {
+  const s = state.settings;
+  if (!force && (s.ratesAuto === false || !navigator.onLine)) return;
+  if (!force && s.ratesUpdatedAt && Date.now() - Date.parse(s.ratesUpdatedAt) < RATE_REFRESH_MS) return;
+  if (ratesBusy) return;
+  ratesBusy = true;
+  try {
+    const { rates, source } = await fetchTwdRates(Object.keys(CURRENCIES).filter(k => k !== 'TWD'));
+    state.settings = { ...state.settings, rates: { ...state.settings.rates, ...rates }, ratesUpdatedAt: new Date().toISOString(), ratesSource: source };
+    await state.store.saveSettings(state.settings);
+    render();
+    if (force) toast(`匯率已更新：1 美元 = ${rates.USD} 元`);
+  } catch (e) {
+    if (force) toast(e.message);
+  } finally {
+    ratesBusy = false;
+  }
 }
 
 async function enablePush(button) {
@@ -1508,8 +1548,44 @@ function subMatches(sub, filter, today) {
 function subPriceHtml(sub) {
   const main = `${priceText(sub.price, sub.currency)}<small>／${cycleLabel(sub)}</small>`;
   const perMonth = monthlyTwd(sub, subRates());
-  const showTwd = sub.currency !== 'TWD' || sub.cycle !== 'month' || sub.every !== 1;
-  return `<b>${main}</b>${showTwd ? `<small>≈ ${money(perMonth)}／月</small>` : ''}`;
+  const showTwd = sub.currency !== 'TWD' || sub.feePct > 0 || usesActual(sub) || sub.cycle !== 'month' || sub.every !== 1;
+  return `<b>${main}</b>${showTwd ? `<small>≈ ${money(perMonth)}／月 ${amountTag(sub)}</small>` : ''}`;
+}
+
+// 金額是「估算」還是「實際（最近幾次平均）」
+const amountTag = sub => (usesActual(sub)
+  ? '<i class="amt-tag actual" title="最近 3 次實際扣款的平均">實際</i>'
+  : (sub.currency !== 'TWD' || sub.feePct > 0 ? `<i class="amt-tag" title="匯率 × (1 + 手續費 ${sub.feePct}%)">估算</i>` : ''));
+
+// 需要對帳的訂閱：外幣或有手續費
+const needsReconcile = sub => sub.currency !== 'TWD' || sub.feePct > 0;
+
+// 最近 45 天內已扣款、還沒填實際金額的期數
+function pendingCharges(today) {
+  const out = [];
+  for (const sub of state.subs) {
+    if (!needsReconcile(sub)) continue;
+    const hist = chargeHistory(sub, today, subRates());
+    for (const h of hist.slice(-2)) {
+      if (h.actual === null && dayDiff(h.date, today) <= 45) out.push({ sub, ...h });
+    }
+  }
+  return out.sort((a, b) => b.date.localeCompare(a.date));
+}
+
+async function recordCharge(button) {
+  const row = button.closest('[data-charge]');
+  const sub = state.subs.find(s => s.id === row.dataset.id);
+  const twd = Number(row.querySelector('input').value);
+  if (!sub) return;
+  if (!(twd > 0)) { toast('請輸入帳單上的新台幣金額'); row.querySelector('input').focus(); return; }
+  const charges = [...sub.charges.filter(c => c.date !== row.dataset.date), { date: row.dataset.date, twd }];
+  try {
+    await state.store.saveSub(normalizeSub({ ...sub, charges, updatedAt: new Date().toISOString() }));
+    toast(`已記錄 ${sub.name} ${fmtDate(row.dataset.date)} 實際扣款 ${money(twd)}`);
+  } catch (e) {
+    toast('儲存失敗：' + e.message);
+  }
 }
 
 function subRow(sub, today) {
@@ -1522,7 +1598,7 @@ function subRow(sub, today) {
   return `<li>
     <button type="button" class="sub-row ${next ? '' : 'cancelled'}" data-action="edit-sub" data-id="${esc(sub.id)}" style="--h:${h}">
       <span class="sub-avatar" aria-hidden="true">${esc([...sub.name][0] || '?')}</span>
-      <span class="sub-main"><strong>${esc(sub.name)}</strong><small>${esc(sub.category || '未分類')}・累計 ${paidCount(sub, today)} 次</small></span>
+      <span class="sub-main"><strong>${esc(sub.name)}</strong><small>${esc(sub.category || '未分類')}・累計 ${paidCount(sub, today)} 次${sub.feePct > 0 ? `・手續費 ${sub.feePct}%` : ''}</small></span>
       <span class="sub-price">${subPriceHtml(sub)}</span>
       <span class="sub-next">${side}</span>
     </button>
@@ -1556,9 +1632,13 @@ function renderSubs() {
   const cancelled = all.length - active.length;
   const monthly = sum(active, s => monthlyTwd(s, rates));
   const upcoming = computeSubAlerts(all, new Date(), 30);
-  const upcomingTotal = sum(upcoming, x => toTwd(x.sub.price, x.sub.currency, rates));
+  const upcomingTotal = sum(upcoming, x => chargeTwd(x.sub, rates));
   const soon = upcoming.filter(x => x.daysUntil <= 7).length;
-  const paidTotal = sum(all, s => paidCount(s, today) * toTwd(s.price, s.currency, rates));
+  const paid = all.map(s => paidSummary(s, today, rates));
+  const paidTotal = sum(paid, p => p.total);
+  const paidCountAll = sum(paid, p => p.count);
+  const actualCountAll = sum(paid, p => p.actualCount);
+  const pending = pendingCharges(today);
   const saved = sum(all.filter(s => !isActive(s, today)), s => monthlyTwd(s, rates));
 
   const byCat = new Map();
@@ -1584,8 +1664,18 @@ function renderSubs() {
       <div class="tile"><small>每月約</small><strong>${money(monthly)}</strong><span>使用中 ${active.length} 項（年繳已平均到每月）</span></div>
       <div class="tile"><small>每年約</small><strong>${money(monthly * 12)}</strong><span>照目前訂閱持續一整年</span></div>
       <div class="tile"><small>未來 30 天將扣款</small><strong class="${soon ? 'warn' : ''}">${money(upcomingTotal)}</strong><span>${upcoming.length} 筆${soon ? `・7 天內 ${soon} 筆` : ''}</span></div>
-      <div class="tile"><small>累計已付</small><strong>${money(paidTotal)}</strong><span>${cancelled ? `已取消 ${cancelled} 項・每月省 ${money(saved)}` : '從第一次扣款算起'}</span></div>
+      <div class="tile"><small>累計已付</small><strong>${money(paidTotal)}</strong><span>${paidCountAll} 期中 ${actualCountAll} 期為實際金額${cancelled ? `・已取消 ${cancelled} 項，每月省 ${money(saved)}` : ''}</span></div>
     </div>
+
+    ${pending.length ? `<div class="panel pending-panel">
+      <h2>${icon('edit')}最近扣款，填上實際金額 <small>選填・照信用卡帳單（含手續費）</small></h2>
+      <ul class="charge-pending">${pending.map(p => `
+        <li data-charge data-id="${esc(p.sub.id)}" data-date="${p.date}">
+          <span class="cp-main"><strong>${esc(p.sub.name)}</strong><small>${fmtDate(p.date)} 扣款・${priceText(p.sub.price, p.sub.currency)}・估算 ${money(p.estimate)}</small></span>
+          <label class="cp-input"><span>NT$</span><input type="number" min="0" step="1" inputmode="decimal" placeholder="${Math.round(p.estimate)}" aria-label="${esc(p.sub.name)} 實際扣款金額"></label>
+          <button type="button" class="btn primary small" data-action="record-charge">記錄</button>
+        </li>`).join('')}</ul>
+    </div>` : ''}
 
     <div class="sub-columns">
       <div class="panel">
@@ -1594,7 +1684,7 @@ function renderSubs() {
           <li class="${daysUntil <= 3 ? 'danger' : daysUntil <= 7 ? 'warn' : ''}">
             <span class="tl-date"><b>${date.slice(5).replace('-', '/')}</b><small>${whenText(daysUntil)}</small></span>
             <button type="button" class="tl-main" data-action="edit-sub" data-id="${esc(sub.id)}">
-              <strong>${esc(sub.name)}</strong><small>${priceText(sub.price, sub.currency)}${sub.currency === 'TWD' ? '' : ` ≈ ${money(toTwd(sub.price, sub.currency, rates))}`}</small>
+              <strong>${esc(sub.name)}</strong><small>${priceText(sub.price, sub.currency)}${needsReconcile(sub) ? ` ≈ ${money(chargeTwd(sub, rates))} ${amountTag(sub)}` : ''}</small>
             </button>
           </li>`).join('')}</ol>`
           : '<p class="muted-text">未來 30 天沒有扣款 🎉</p>'}
@@ -1629,7 +1719,7 @@ function subAlertPanel() {
       return `<li class="alert-item">
         <div class="alert-main">
           <strong>${esc(sub.name)}</strong>
-          <small>${priceText(sub.price, sub.currency)}／${cycleLabel(sub)}${sub.currency === 'TWD' ? '' : `・約 ${money(toTwd(sub.price, sub.currency, rates))}`}・${esc(sub.category || '未分類')}</small>
+          <small>${priceText(sub.price, sub.currency)}／${cycleLabel(sub)}${needsReconcile(sub) ? `・約 ${money(chargeTwd(sub, rates))}（${usesActual(sub) ? '依實際' : `含 ${sub.feePct}% 手續費`}）` : ''}・${esc(sub.category || '未分類')}</small>
         </div>
         <div class="alert-side"><span class="when ${daysUntil <= 3 ? 'danger' : daysUntil <= 7 ? 'warn' : ''}">${whenText(daysUntil)}</span><small>${fmtDate(date)}</small></div>
         <div class="alert-actions">
@@ -1645,8 +1735,18 @@ function bindSubEditor() {
   const form = $('#sub-form');
   form.currency.innerHTML = Object.entries(CURRENCIES).map(([k, c]) => `<option value="${k}">${esc(c.symbol)} ${esc(c.label)}</option>`).join('');
   form.every.innerHTML = Array.from({ length: 12 }, (_, i) => `<option value="${i + 1}">每 ${i + 1}</option>`).join('');
-  form.addEventListener('input', updateSubPreview);
-  form.addEventListener('change', updateSubPreview);
+  form.addEventListener('input', e => { if (!e.target.closest('#sub-charges')) updateSubPreview(); });
+  form.addEventListener('change', e => {
+    if (e.target.closest('#sub-charges')) { updateSubPreview(); return; }
+    // 換幣別時，如果手續費還是預設值，就跟著換成新幣別的預設
+    if (e.target === form.currency) {
+      const prev = form.currency.dataset.prev || 'TWD';
+      if (Number(form.feePct.value) === defaultFeePct(prev) || form.feePct.value === '') form.feePct.value = defaultFeePct(form.currency.value);
+      form.currency.dataset.prev = form.currency.value;
+    }
+    if (['currency', 'price', 'feePct', 'cycle', 'every', 'startDate', 'cancelledAt'].includes(e.target.name)) renderChargeRows();
+    updateSubPreview();
+  });
   form.addEventListener('submit', submitSubEditor);
   $('#sub-delete').addEventListener('click', deleteCurrentSub);
 }
@@ -1659,8 +1759,39 @@ function subFromForm() {
     name: form.name.value, category: form.category.value, price: form.price.value, currency: form.currency.value,
     cycle: form.cycle.value, every: form.every.value, startDate: form.startDate.value,
     cancelledAt: form.cancelledAt.value, link: form.link.value, note: form.note.value,
+    feePct: form.feePct.value, charges: chargesFromForm(old),
     updatedAt: new Date().toISOString()
   });
+}
+
+// 表單裡顯示的期數用輸入框的值；沒顯示的舊紀錄保留原值
+function chargesFromForm(old) {
+  const shown = new Map($$('#sub-charges [data-date]').map(li => [li.dataset.date, Number(li.querySelector('input').value) || 0]));
+  const kept = (old?.charges || []).filter(c => !shown.has(c.date));
+  return [...kept, ...[...shown].filter(([, twd]) => twd > 0).map(([date, twd]) => ({ date, twd }))];
+}
+
+// 編輯視窗：列出最近 12 期，可以填實際扣款金額
+function renderChargeRows() {
+  const form = $('#sub-form');
+  const box = $('#sub-charges');
+  const typed = new Map($$('#sub-charges [data-date]').map(li => [li.dataset.date, li.querySelector('input').value]));
+  if (!form.startDate.value || !form.price.value) { $('#sub-charges-field').hidden = true; box.innerHTML = ''; return; }
+  const old = state.subs.find(s => s.id === state.editingSubId);
+  const sub = normalizeSub({
+    ...(old || {}), price: form.price.value, currency: form.currency.value, feePct: form.feePct.value,
+    cycle: form.cycle.value, every: form.every.value, startDate: form.startDate.value, cancelledAt: form.cancelledAt.value
+  });
+  const hist = chargeHistory(sub, taipeiToday(), subRates()).slice(-12).reverse();
+  $('#sub-charges-field').hidden = !hist.length;
+  box.innerHTML = hist.map(h => {
+    const value = typed.has(h.date) ? typed.get(h.date) : (h.actual ?? '');
+    return `<li data-date="${h.date}">
+      <span class="cl-date">${fmtDate(h.date)}</span>
+      <span class="cl-est">估算 ${money(h.estimate)}</span>
+      <label class="cp-input"><span>NT$</span><input type="number" min="0" step="1" inputmode="decimal" value="${esc(value)}" placeholder="實際金額" aria-label="${fmtDate(h.date)} 實際扣款"></label>
+    </li>`;
+  }).join('');
 }
 
 function updateSubPreview() {
@@ -1669,10 +1800,16 @@ function updateSubPreview() {
   const sub = subFromForm();
   const today = taipeiToday();
   const next = nextCharge(sub, today);
-  const paid = paidCount(sub, today);
-  const parts = [`每月約 ${money(monthlyTwd(sub, subRates()))}`];
+  const paid = paidSummary(sub, today, subRates());
+  const parts = [];
+  if (needsReconcile(sub)) {
+    parts.push(usesActual(sub)
+      ? `每期約 ${money(chargeTwd(sub, subRates()))}（最近 ${Math.min(3, sub.charges.length)} 次實際平均）`
+      : `每期估算 ${money(estimateTwd(sub, subRates()))}（${priceText(sub.price, sub.currency)} × 匯率 ${rateOf(sub.currency, subRates())} × ${(1 + sub.feePct / 100).toFixed(3).replace(/0+$/, '')}）`);
+  }
+  parts.push(`每月約 ${money(monthlyTwd(sub, subRates()))}`);
   parts.push(next ? `下次扣款 ${fmtDate(next)}（${whenText(dayDiff(today, next))}）` : '已取消，不會再扣款');
-  if (paid) parts.push(`至今已扣 ${paid} 次，共約 ${money(paid * toTwd(sub.price, sub.currency, subRates()))}`);
+  if (paid.count) parts.push(`至今已扣 ${paid.count} 次，共約 ${money(paid.total)}${paid.actualCount ? `（其中 ${paid.actualCount} 次為實際金額）` : ''}`);
   $('#sub-preview').textContent = parts.join('・');
 }
 
@@ -1685,6 +1822,10 @@ function openSubEditor(id) {
   for (const key of ['name', 'category', 'price', 'currency', 'cycle', 'every', 'startDate', 'cancelledAt', 'link', 'note']) {
     form[key].value = s[key] ?? '';
   }
+  form.feePct.value = sub ? sub.feePct : defaultFeePct(s.currency);
+  form.currency.dataset.prev = s.currency;
+  $('#sub-charges').innerHTML = '';
+  renderChargeRows();
   const used = state.subs.map(x => x.category).filter(Boolean);
   $('#dl-sub-category').innerHTML = [...new Set([...SUB_CATEGORIES, ...used])].map(v => `<option value="${esc(v)}">`).join('');
   $('#sub-title').textContent = sub ? '編輯訂閱' : '新增訂閱';
