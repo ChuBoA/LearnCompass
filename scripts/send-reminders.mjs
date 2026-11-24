@@ -3,6 +3,7 @@
 // TEST_PUSH=true 時不看規則，直接送一則測試通知給所有已註冊的裝置。
 import admin from 'firebase-admin';
 import { computePushMessages, DEFAULT_SETTINGS, taipeiToday } from '../js/reminders.js';
+import { computeSubPushMessages, normalizeSub } from '../js/subs.js';
 
 if (!process.env.FIREBASE_SERVICE_ACCOUNT) {
   console.error('缺少 FIREBASE_SERVICE_ACCOUNT，請在 GitHub 的 Settings > Secrets and variables > Actions 新增。');
@@ -45,8 +46,8 @@ const users = await db.collection('users').listDocuments();
 console.log(`今天（台灣）${taipeiToday()}，共 ${users.length} 位使用者`);
 
 for (const userRef of users) {
-  const [userSnap, courseSnap, tokenSnap] = await Promise.all([
-    userRef.get(), userRef.collection('courses').get(), userRef.collection('tokens').get()
+  const [userSnap, courseSnap, tokenSnap, subSnap] = await Promise.all([
+    userRef.get(), userRef.collection('courses').get(), userRef.collection('tokens').get(), userRef.collection('subs').get()
   ]);
   let tokens = tokenSnap.docs.map(d => d.data().token).filter(Boolean);
   if (!tokens.length) continue;
@@ -54,7 +55,10 @@ for (const userRef of users) {
   const settings = { ...DEFAULT_SETTINGS, ...(userSnap.data()?.settings || {}) };
   const messages = testMode
     ? [{ tag: 'test', title: '🧭 學習羅盤', body: '推播測試成功！之後每天早上會在這裡提醒你。' }]
-    : computePushMessages(courseSnap.docs.map(d => d.data()), settings);
+    : [
+        ...computePushMessages(courseSnap.docs.map(d => d.data()), settings),
+        ...computeSubPushMessages(subSnap.docs.map(d => normalizeSub(d.data())), settings)
+      ];
   console.log(`使用者 ${userRef.id.slice(0, 6)}…：${tokens.length} 台裝置、${messages.length} 則通知`);
 
   for (const message of messages) {

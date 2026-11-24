@@ -60,6 +60,7 @@
       <nav class="tabs" aria-label="主選單">
         <button type="button" data-tab="courses" class="active"><svg class="i"><use href="#i-grid"/></svg><span>課程</span></button>
         <button type="button" data-tab="notes"><svg class="i"><use href="#i-note"/></svg><span>筆記</span></button>
+        <button type="button" data-tab="subs"><svg class="i"><use href="#i-card"/></svg><span>訂閱</span></button>
         <button type="button" data-tab="alerts"><svg class="i"><use href="#i-bell"/></svg><span>提醒</span><b class="count" id="alert-count" hidden></b></button>
         <button type="button" data-tab="stats"><svg class="i"><use href="#i-chart"/></svg><span>統計</span></button>
         <button type="button" data-tab="settings"><svg class="i"><use href="#i-gear"/></svg><span>設定</span></button>
@@ -111,6 +112,7 @@
         <div class="note-grid" id="note-grid"></div>
       </section>
 
+      <section id="view-subs" class="view" hidden></section>
       <section id="view-alerts" class="view" hidden></section>
       <section id="view-stats" class="view" hidden></section>
       <section id="view-settings" class="view" hidden></section>
@@ -207,6 +209,43 @@
     <p class="viewer-note" id="viewer-note" hidden></p>
   </dialog>
 
+  <dialog id="sub-editor">
+    <form method="dialog" id="sub-form">
+      <header class="dlg-head">
+        <h2 id="sub-title">新增訂閱</h2>
+        <button type="button" class="btn quiet icon-only" data-close aria-label="關閉"><svg class="i"><use href="#i-x"/></svg></button>
+      </header>
+      <div class="dlg-body">
+        <label class="field full">名稱<input name="name" required maxlength="100" placeholder="例如：ChatGPT Plus、Canva Pro"></label>
+        <label class="field">類別<input name="category" list="dl-sub-category" maxlength="30"></label>
+        <label class="field">金額
+          <span class="money-input">
+            <select name="currency" aria-label="幣別"></select>
+            <input name="price" type="number" min="0" step="0.01" inputmode="decimal" required aria-label="金額">
+          </span>
+        </label>
+        <label class="field">扣款週期
+          <span class="money-input">
+            <select name="every" aria-label="每幾個週期"></select>
+            <select name="cycle" aria-label="週期單位"><option value="month">個月</option><option value="year">年</option></select>
+          </span>
+        </label>
+        <label class="field">第一次扣款日<small>免費試用請填試用結束、開始扣款那天</small><input name="startDate" type="date" required></label>
+        <p class="field full sub-preview" id="sub-preview"></p>
+        <label class="field full">管理訂閱的網址<small>方便要取消時直接前往</small><input name="link" type="url" inputmode="url" placeholder="https://"></label>
+        <label class="field full">備註<textarea name="note" rows="3" placeholder="付款方式、帳號、共用的人…"></textarea></label>
+        <label class="field">取消日期<small>已取消才填，這天以後不再扣款</small><input name="cancelledAt" type="date"></label>
+      </div>
+      <footer class="dlg-foot">
+        <button type="button" class="btn danger" id="sub-delete">刪除</button>
+        <span class="spacer"></span>
+        <button type="button" class="btn ghost" data-close>取消</button>
+        <button type="submit" class="btn primary" value="save">儲存</button>
+      </footer>
+    </form>
+  </dialog>
+  <datalist id="dl-sub-category"></datalist>
+
   <dialog id="pin-dialog" class="small-dialog">
     <form method="dialog" id="pin-form">
       <header class="dlg-head">
@@ -253,6 +292,8 @@
       <symbol id="i-clip" viewBox="0 0 24 24"><path d="m21 11.5-8.6 8.6a5.5 5.5 0 0 1-7.8-7.8l8.6-8.6a3.7 3.7 0 0 1 5.2 5.2l-8.6 8.6a1.8 1.8 0 0 1-2.6-2.6l8-8"/></symbol>
       <symbol id="i-cloud" viewBox="0 0 24 24"><path d="M7 18a5 5 0 0 1-.6-10A6 6 0 0 1 18 9a4.5 4.5 0 0 1-.5 9Z"/></symbol>
       <symbol id="i-file" viewBox="0 0 24 24"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8Z"/><path d="M14 3v5h5"/></symbol>
+      <symbol id="i-card" viewBox="0 0 24 24"><rect x="2.5" y="5" width="19" height="14" rx="2.5"/><path d="M2.5 10h19M6.5 15h4"/></symbol>
+      <symbol id="i-repeat" viewBox="0 0 24 24"><path d="M17 2l4 4-4 4"/><path d="M3 11V9a3 3 0 0 1 3-3h15M7 22l-4-4 4-4"/><path d="M21 13v2a3 3 0 0 1-3 3H3"/></symbol>
       <symbol id="i-logout" viewBox="0 0 24 24"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/></symbol>
       <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></symbol>
       <symbol id="i-user" viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/></symbol>

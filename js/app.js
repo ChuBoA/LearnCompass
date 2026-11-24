@@ -2,13 +2,17 @@ import { createStore, getPushToken } from './store.js';
 import { csvToCourses, coursesToCsv, mergeImport, normalizeCourse, newId } from './csv.js';
 import {
   DEFAULT_SETTINGS, computeAlerts, courseStatus, daysLeft, upcomingSessions,
-  formatSession, taipeiToday, idleDays
+  formatSession, taipeiToday, idleDays, dayDiff
 } from './reminders.js';
 import {
   AUTO_LOCK_CHOICES, lockSettings, needsUnlock, markUnlocked, markLocked, watchVisibility,
   verifyPin, setPin, clearPin, setAutoLock, isValidPin
 } from './lock.js';
 import { normalizeNote, normalizeAttachment, isNoteEmpty, parseTags, setupRichEditor } from './notes.js';
+import {
+  CURRENCIES, SUB_CATEGORIES, normalizeSub, isActive, nextCharge, paidCount, rateOf, toTwd, monthlyTwd,
+  cycleLabel, priceText, computeSubAlerts
+} from './subs.js';
 import {
   MAX_FILE_BYTES, MAX_ATTACHMENTS, NeedAuthError, driveConfigured, driveConnected, driveTokenExpiry,
   setDriveAccount, preloadDrive, connectDrive, disconnectDrive, processQueue, prepareImage,
@@ -44,6 +48,9 @@ const state = {
   noteTimer: null,
   rich: null,
   notesLoaded: false,
+  subs: [],
+  subFilter: 'active',  // active | month | year | cancelled | all
+  editingSubId: null,
   localPending: new Set(), // 這台裝置還沒上傳到雲端硬碟的附件 id
   uploadingId: null,
   driveError: ''
@@ -134,6 +141,11 @@ async function boot() {
       state.notes = notes.map(normalizeNote);
       render();
       if (!state.notesLoaded) { state.notesLoaded = true; syncDrive(false); }
+    },
+    onSubs: async subs => {
+      state.store = await storeReady;
+      state.subs = subs.map(normalizeSub);
+      render();
     }
   });
   state.store = await storeReady;
@@ -279,13 +291,15 @@ function bindEvents() {
     if (action !== 'go') e.preventDefault();
     if (el.closest('details.menu')) el.closest('details.menu').open = false;
     switch (action) {
-      case 'new': openEditor(null); break;
+      case 'new': if (state.tab === 'subs') openSubEditor(null); else openEditor(null); break;
+      case 'edit-sub': openSubEditor(id); break;
+      case 'sub-filter': state.subFilter = el.dataset.value; renderSubs(); break;
       case 'edit': openEditor(id); break;
       case 'delete': deleteCourse(id); break;
       case 'go': break;
       case 'import': $('#file-import').click(); break;
       case 'export-csv': download(`學習羅盤_${taipeiToday()}.csv`, coursesToCsv(sortedForExport()), 'text/csv;charset=utf-8'); break;
-      case 'export-json': download(`學習羅盤備份_${taipeiToday()}.json`, JSON.stringify({ version: 2, courses: state.courses, notes: state.notes, settings: state.settings }, null, 2), 'application/json'); break;
+      case 'export-json': download(`學習羅盤備份_${taipeiToday()}.json`, JSON.stringify({ version: 3, courses: state.courses, notes: state.notes, subs: state.subs, settings: state.settings }, null, 2), 'application/json'); break;
       case 'logout': if (confirm('確定要登出嗎？')) state.store.signOut(); break;
       case 'tab': switchTab(el.dataset.tab); break;
       case 'filter-status': $('#f-status').value = el.dataset.value; $('#f-category').value = ''; switchTab('courses'); renderCourses(); break;
@@ -351,6 +365,7 @@ function bindEvents() {
   $$('dialog [data-close]').forEach(b => b.addEventListener('click', () => b.closest('dialog').close()));
   form.addEventListener('submit', submitEditor);
   $('#pin-form').addEventListener('submit', submitPin);
+  bindSubEditor();
 
   $('#view-settings').addEventListener('change', e => {
     if (e.target.name === 'autoLock') { setAutoLock(Number(e.target.value)); toast('自動上鎖已更新'); return; }
@@ -364,6 +379,8 @@ function switchTab(tab) {
   $$('.tabs button').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
   $$('.view').forEach(v => { v.hidden = v.id !== 'view-' + tab; });
   $('#hero').hidden = tab !== 'courses';
+  // 右上角的新增按鈕：在訂閱頁就是「新增訂閱」
+  $('.top-actions [data-action="new"] span').textContent = tab === 'subs' ? '新增訂閱' : '新增課程';
   render();
   scrollTo({ top: 0 });
 }
@@ -393,25 +410,29 @@ async function importFile(file) {
     const text = await file.text();
     let incoming;
     let notes = [];
+    let subs = [];
     let settings = null;
     if (/\.json$/i.test(file.name) || text.trim().startsWith('{')) {
       const data = JSON.parse(text);
       incoming = (Array.isArray(data) ? data : data.courses || []).map(normalizeCourse);
       notes = (data.notes || []).map(normalizeNote);
+      subs = (data.subs || []).map(normalizeSub);
       settings = data.settings || null;
     } else {
       incoming = csvToCourses(text);
     }
-    if (!incoming.length && !notes.length) { toast('檔案裡沒有找到課程或筆記'); return; }
+    if (!incoming.length && !notes.length && !subs.length) { toast('檔案裡沒有找到課程、筆記或訂閱'); return; }
     const { courses, added, updated } = mergeImport(state.courses, incoming);
     const sessions = sum(courses, c => c.sessions.length);
     const noteNew = notes.filter(n => !state.notes.some(o => o.id === n.id)).length;
     const lines = [];
     if (courses.length) lines.push(`・課程 ${courses.length} 門：新增 ${added}、更新 ${updated}（以課程名稱＋購買日期比對），共 ${sessions} 個上課場次`);
     if (notes.length) lines.push(`・筆記 ${notes.length} 篇：新增 ${noteNew}、更新 ${notes.length - noteNew}`);
+    if (subs.length) lines.push(`・訂閱 ${subs.length} 項`);
     if (!confirm(`即將匯入：\n${lines.join('\n')}\n\n確定匯入？`)) return;
     if (courses.length) await state.store.saveMany(courses);
     if (notes.length) await state.store.saveNotes(notes);
+    if (subs.length) await state.store.saveSubs(subs);
     if (settings) {
       state.settings = { ...DEFAULT_SETTINGS, ...settings };
       await state.store.saveSettings(state.settings);
@@ -432,11 +453,13 @@ function render() {
   renderHero();
   renderFilters();
   const alerts = computeAlerts(state.courses, state.settings);
-  const urgent = alerts.expiring.filter(a => a.daysLeft <= 7).length + alerts.sessions.filter(a => a.daysUntil <= 1).length;
+  const urgent = alerts.expiring.filter(a => a.daysLeft <= 7).length + alerts.sessions.filter(a => a.daysUntil <= 1).length
+    + computeSubAlerts(state.subs, new Date(), 3).length;
   $('#alert-count').hidden = !urgent;
   $('#alert-count').textContent = urgent;
   if (state.tab === 'courses') renderCourses();
   if (state.tab === 'notes') renderNotes();
+  if (state.tab === 'subs') renderSubs();
   if (state.tab === 'alerts') renderAlerts(alerts);
   if (state.tab === 'stats') renderStats();
   if (state.tab === 'settings') renderSettings();
@@ -1160,6 +1183,7 @@ function renderAlerts(alerts) {
   const dayText = d => (d === 0 ? '今天' : d === 1 ? '明天' : `${d} 天後`);
   $('#view-alerts').innerHTML = `
     ${pushOn ? '' : `<div class="callout">${icon('bell')}<div><strong>想在手機收到提醒嗎？</strong><p>到「設定」開啟推播通知，APP 沒打開也會提醒你。</p></div><button class="btn primary small" type="button" data-action="tab" data-tab="settings">前往設定</button></div>`}
+    ${subAlertPanel()}
     <div class="panel">
       <h2>${icon('cal')}即將上課 <small>未來 14 天</small></h2>
       ${sessions.length ? `<ul class="alert-list">${sessions.map(({ course, session, daysUntil }) =>
@@ -1345,6 +1369,20 @@ function renderSettings() {
             推播一次摘要</label>
           <p class="muted-text">移動課程卡片上的「學習能量」就會記錄為最近一次學習。</p>
         </fieldset>
+        <fieldset data-setting>
+          <legend>訂閱扣款前，第幾天提醒</legend>
+          <div class="chips">${[7, 3, 1, 0].map(d => `
+            <label class="chip"><input type="checkbox" name="subNotifyDays" value="${d}" ${subNotifyDays().includes(d) ? 'checked' : ''}><span>${d === 0 ? '當天' : `${d} 天前`}</span></label>`).join('')}</div>
+        </fieldset>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>${icon('card')}外幣匯率 <small>訂閱統計換算成新台幣用</small></h2>
+      <p class="muted-text">1 單位外幣等於多少新台幣。匯率不會自動更新，偶爾對照銀行或信用卡帳單調整即可。</p>
+      <div class="rate-grid" data-setting>${Object.entries(CURRENCIES).filter(([k]) => k !== 'TWD').map(([k, c]) => `
+        <label class="rate-field"><span>1 ${esc(c.label)}（${esc(c.symbol)}）=</span>
+          <input type="number" name="rate-${k}" min="0" step="0.0001" inputmode="decimal" value="${rateOf(k, state.settings.rates)}"><span>NT$</span></label>`).join('')}
       </div>
     </div>
 
@@ -1365,10 +1403,15 @@ async function saveSettingsFromForm() {
     expiryNotifyDays: [...root.querySelectorAll('[name=expiryNotifyDays]:checked')].map(i => Number(i.value)),
     sessionNotify: root.querySelector('[name=sessionNotify]').checked,
     staleDays: Math.max(3, Number(root.querySelector('[name=staleDays]').value) || DEFAULT_SETTINGS.staleDays),
-    staleDigestWeekday: Number(root.querySelector('[name=staleDigestWeekday]').value)
+    staleDigestWeekday: Number(root.querySelector('[name=staleDigestWeekday]').value),
+    subNotifyDays: [...root.querySelectorAll('[name=subNotifyDays]:checked')].map(i => Number(i.value)),
+    rates: Object.fromEntries(Object.keys(CURRENCIES).filter(k => k !== 'TWD').map(k => {
+      const v = Number(root.querySelector(`[name=rate-${k}]`)?.value);
+      return [k, v > 0 ? v : rateOf(k, state.settings.rates)];
+    }))
   };
-  state.settings = s;
-  try { await state.store.saveSettings(s); toast('提醒設定已儲存'); }
+  state.settings = { ...state.settings, ...s };
+  try { await state.store.saveSettings(state.settings); toast('設定已儲存'); }
   catch (e) { toast('儲存失敗：' + e.message); }
 }
 
@@ -1445,6 +1488,231 @@ async function submitEditor(e) {
   $('#editor').close();
   await saveCourse(course);
   toast(old ? '已更新' : '已新增課程 🌱');
+}
+
+// ---------- 訂閱 ----------
+const subNotifyDays = () => (Array.isArray(state.settings.subNotifyDays) ? state.settings.subNotifyDays : DEFAULT_SETTINGS.subNotifyDays);
+const subRates = () => state.settings.rates;
+const whenText = d => (d === 0 ? '今天' : d === 1 ? '明天' : `${d} 天後`);
+const SUB_FILTERS = [['active', '使用中'], ['month', '月繳'], ['year', '年繳'], ['cancelled', '已取消'], ['all', '全部']];
+
+function subMatches(sub, filter, today) {
+  const active = isActive(sub, today);
+  if (filter === 'active') return active;
+  if (filter === 'cancelled') return !active;
+  if (filter === 'month') return active && sub.cycle === 'month';
+  if (filter === 'year') return active && sub.cycle === 'year';
+  return true;
+}
+
+function subPriceHtml(sub) {
+  const main = `${priceText(sub.price, sub.currency)}<small>／${cycleLabel(sub)}</small>`;
+  const perMonth = monthlyTwd(sub, subRates());
+  const showTwd = sub.currency !== 'TWD' || sub.cycle !== 'month' || sub.every !== 1;
+  return `<b>${main}</b>${showTwd ? `<small>≈ ${money(perMonth)}／月</small>` : ''}`;
+}
+
+function subRow(sub, today) {
+  const next = nextCharge(sub, today);
+  const days = next ? dayDiff(today, next) : null;
+  const h = hueOf(sub.category || sub.name);
+  const side = next
+    ? `<span class="when ${days <= 3 ? 'danger' : days <= 7 ? 'warn' : ''}">${whenText(days)}</span><small>${fmtDate(next)} 扣款</small>`
+    : `<span class="when muted">已取消</span><small>${fmtDate(sub.cancelledAt)}</small>`;
+  return `<li>
+    <button type="button" class="sub-row ${next ? '' : 'cancelled'}" data-action="edit-sub" data-id="${esc(sub.id)}" style="--h:${h}">
+      <span class="sub-avatar" aria-hidden="true">${esc([...sub.name][0] || '?')}</span>
+      <span class="sub-main"><strong>${esc(sub.name)}</strong><small>${esc(sub.category || '未分類')}・累計 ${paidCount(sub, today)} 次</small></span>
+      <span class="sub-price">${subPriceHtml(sub)}</span>
+      <span class="sub-next">${side}</span>
+    </button>
+  </li>`;
+}
+
+function subBars(groups) {
+  const max = Math.max(1, ...groups.map(g => g.monthly));
+  return `<div class="bars">${groups.map(g => `
+    <div class="bar-row">
+      <div class="bar-label">${esc(g.key)}<small>${g.count} 項</small></div>
+      <div class="bar-track"><div class="bar" style="width:${(g.monthly / max) * 100}%"></div></div>
+      <div class="bar-value">${money(g.monthly)}<small>／月</small></div>
+    </div>`).join('')}</div>`;
+}
+
+function renderSubs() {
+  const view = $('#view-subs');
+  const today = taipeiToday();
+  const all = state.subs;
+  if (!all.length) {
+    view.innerHTML = `<div class="empty-state">
+      <p>還沒有訂閱紀錄 💳</p>
+      <p>把每月、每年自動扣款的軟體或服務記下來，就能看到每個月實際花多少，並在扣款前收到提醒。</p>
+      <button class="btn primary" type="button" data-action="new">${icon('plus')}新增訂閱</button>
+    </div>`;
+    return;
+  }
+  const rates = subRates();
+  const active = all.filter(s => isActive(s, today));
+  const cancelled = all.length - active.length;
+  const monthly = sum(active, s => monthlyTwd(s, rates));
+  const upcoming = computeSubAlerts(all, new Date(), 30);
+  const upcomingTotal = sum(upcoming, x => toTwd(x.sub.price, x.sub.currency, rates));
+  const soon = upcoming.filter(x => x.daysUntil <= 7).length;
+  const paidTotal = sum(all, s => paidCount(s, today) * toTwd(s.price, s.currency, rates));
+  const saved = sum(all.filter(s => !isActive(s, today)), s => monthlyTwd(s, rates));
+
+  const byCat = new Map();
+  for (const s of active) {
+    const k = s.category || '未分類';
+    const g = byCat.get(k) || { key: k, count: 0, monthly: 0 };
+    g.count++;
+    g.monthly += monthlyTwd(s, rates);
+    byCat.set(k, g);
+  }
+  const cats = [...byCat.values()].sort((a, b) => b.monthly - a.monthly);
+
+  const list = all.filter(s => subMatches(s, state.subFilter, today)).sort((a, b) => {
+    const na = nextCharge(a, today);
+    const nb = nextCharge(b, today);
+    if (na && nb) return na.localeCompare(nb);
+    if (na || nb) return na ? -1 : 1;
+    return (b.cancelledAt || '').localeCompare(a.cancelledAt || '');
+  });
+
+  view.innerHTML = `
+    <div class="stat-tiles">
+      <div class="tile"><small>每月約</small><strong>${money(monthly)}</strong><span>使用中 ${active.length} 項（年繳已平均到每月）</span></div>
+      <div class="tile"><small>每年約</small><strong>${money(monthly * 12)}</strong><span>照目前訂閱持續一整年</span></div>
+      <div class="tile"><small>未來 30 天將扣款</small><strong class="${soon ? 'warn' : ''}">${money(upcomingTotal)}</strong><span>${upcoming.length} 筆${soon ? `・7 天內 ${soon} 筆` : ''}</span></div>
+      <div class="tile"><small>累計已付</small><strong>${money(paidTotal)}</strong><span>${cancelled ? `已取消 ${cancelled} 項・每月省 ${money(saved)}` : '從第一次扣款算起'}</span></div>
+    </div>
+
+    <div class="sub-columns">
+      <div class="panel">
+        <h2>${icon('cal')}即將續訂 <small>未來 30 天</small></h2>
+        ${upcoming.length ? `<ol class="timeline">${upcoming.map(({ sub, date, daysUntil }) => `
+          <li class="${daysUntil <= 3 ? 'danger' : daysUntil <= 7 ? 'warn' : ''}">
+            <span class="tl-date"><b>${date.slice(5).replace('-', '/')}</b><small>${whenText(daysUntil)}</small></span>
+            <button type="button" class="tl-main" data-action="edit-sub" data-id="${esc(sub.id)}">
+              <strong>${esc(sub.name)}</strong><small>${priceText(sub.price, sub.currency)}${sub.currency === 'TWD' ? '' : ` ≈ ${money(toTwd(sub.price, sub.currency, rates))}`}</small>
+            </button>
+          </li>`).join('')}</ol>`
+          : '<p class="muted-text">未來 30 天沒有扣款 🎉</p>'}
+      </div>
+      <div class="panel">
+        <h2>${icon('chart')}依類別 <small>每月花費</small></h2>
+        ${cats.length ? subBars(cats) : '<p class="muted-text">目前沒有使用中的訂閱</p>'}
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="sub-list-head">
+        <h2>${icon('card')}訂閱清單</h2>
+        <div class="seg-filter" role="group" aria-label="篩選訂閱">${SUB_FILTERS.map(([v, label]) => {
+          const n = all.filter(s => subMatches(s, v, today)).length;
+          return `<button type="button" data-action="sub-filter" data-value="${v}" aria-pressed="${state.subFilter === v}">${label}<b>${n}</b></button>`;
+        }).join('')}</div>
+      </div>
+      ${list.length ? `<ul class="sub-list">${list.map(s => subRow(s, today)).join('')}</ul>` : '<p class="muted-text">這個分類沒有訂閱</p>'}
+    </div>`;
+}
+
+// 「提醒」頁最上方：30 天內要扣款的訂閱
+function subAlertPanel() {
+  if (!state.subs.length) return '';
+  const rates = subRates();
+  const list = computeSubAlerts(state.subs, new Date(), 30);
+  return `<div class="panel">
+    <h2>${icon('card')}即將扣款的訂閱 <small>未來 30 天</small></h2>
+    ${list.length ? `<ul class="alert-list">${list.map(({ sub, date, daysUntil }) => {
+      const link = safeUrl(sub.link);
+      return `<li class="alert-item">
+        <div class="alert-main">
+          <strong>${esc(sub.name)}</strong>
+          <small>${priceText(sub.price, sub.currency)}／${cycleLabel(sub)}${sub.currency === 'TWD' ? '' : `・約 ${money(toTwd(sub.price, sub.currency, rates))}`}・${esc(sub.category || '未分類')}</small>
+        </div>
+        <div class="alert-side"><span class="when ${daysUntil <= 3 ? 'danger' : daysUntil <= 7 ? 'warn' : ''}">${whenText(daysUntil)}</span><small>${fmtDate(date)}</small></div>
+        <div class="alert-actions">
+          ${link ? `<a class="btn dark small" data-action="go" href="${esc(link)}" target="_blank" rel="noopener">管理${icon('arrow')}</a>` : ''}
+          <button class="btn soft small icon-only" type="button" data-action="edit-sub" data-id="${esc(sub.id)}" aria-label="編輯">${icon('edit')}</button>
+        </div>
+      </li>`;
+    }).join('')}</ul>` : '<p class="muted-text">未來 30 天沒有訂閱要扣款 🎉</p>'}
+  </div>`;
+}
+
+function bindSubEditor() {
+  const form = $('#sub-form');
+  form.currency.innerHTML = Object.entries(CURRENCIES).map(([k, c]) => `<option value="${k}">${esc(c.symbol)} ${esc(c.label)}</option>`).join('');
+  form.every.innerHTML = Array.from({ length: 12 }, (_, i) => `<option value="${i + 1}">每 ${i + 1}</option>`).join('');
+  form.addEventListener('input', updateSubPreview);
+  form.addEventListener('change', updateSubPreview);
+  form.addEventListener('submit', submitSubEditor);
+  $('#sub-delete').addEventListener('click', deleteCurrentSub);
+}
+
+function subFromForm() {
+  const form = $('#sub-form');
+  const old = state.subs.find(s => s.id === state.editingSubId);
+  return normalizeSub({
+    ...(old || {}),
+    name: form.name.value, category: form.category.value, price: form.price.value, currency: form.currency.value,
+    cycle: form.cycle.value, every: form.every.value, startDate: form.startDate.value,
+    cancelledAt: form.cancelledAt.value, link: form.link.value, note: form.note.value,
+    updatedAt: new Date().toISOString()
+  });
+}
+
+function updateSubPreview() {
+  const form = $('#sub-form');
+  if (!form.startDate.value || !form.price.value) { $('#sub-preview').textContent = ''; return; }
+  const sub = subFromForm();
+  const today = taipeiToday();
+  const next = nextCharge(sub, today);
+  const paid = paidCount(sub, today);
+  const parts = [`每月約 ${money(monthlyTwd(sub, subRates()))}`];
+  parts.push(next ? `下次扣款 ${fmtDate(next)}（${whenText(dayDiff(today, next))}）` : '已取消，不會再扣款');
+  if (paid) parts.push(`至今已扣 ${paid} 次，共約 ${money(paid * toTwd(sub.price, sub.currency, subRates()))}`);
+  $('#sub-preview').textContent = parts.join('・');
+}
+
+function openSubEditor(id) {
+  const sub = id ? state.subs.find(s => s.id === id) : null;
+  state.editingSubId = sub ? sub.id : null;
+  const form = $('#sub-form');
+  form.reset();
+  const s = sub || { currency: 'TWD', cycle: 'month', every: 1, startDate: taipeiToday() };
+  for (const key of ['name', 'category', 'price', 'currency', 'cycle', 'every', 'startDate', 'cancelledAt', 'link', 'note']) {
+    form[key].value = s[key] ?? '';
+  }
+  const used = state.subs.map(x => x.category).filter(Boolean);
+  $('#dl-sub-category').innerHTML = [...new Set([...SUB_CATEGORIES, ...used])].map(v => `<option value="${esc(v)}">`).join('');
+  $('#sub-title').textContent = sub ? '編輯訂閱' : '新增訂閱';
+  $('#sub-delete').hidden = !sub;
+  updateSubPreview();
+  $('#sub-editor').showModal();
+}
+
+async function submitSubEditor(e) {
+  e.preventDefault();
+  const sub = subFromForm();
+  const isNew = !state.editingSubId;
+  $('#sub-editor').close();
+  try {
+    await state.store.saveSub(sub);
+    toast(isNew ? `已新增訂閱「${sub.name}」` : '已更新');
+  } catch (err) {
+    toast('儲存失敗：' + err.message);
+  }
+}
+
+async function deleteCurrentSub() {
+  const sub = state.subs.find(s => s.id === state.editingSubId);
+  if (!sub) return;
+  if (!confirm(`確定要刪除「${sub.name}」嗎？\n刪除後累計已付的紀錄也會消失。\n如果只是不再續訂，建議改填「取消日期」保留紀錄。`)) return;
+  $('#sub-editor').close();
+  await state.store.removeSub(sub.id);
+  toast('已刪除訂閱');
 }
 
 boot().catch(e => {

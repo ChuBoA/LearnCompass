@@ -3,9 +3,9 @@ import { DEFAULT_SETTINGS } from './reminders.js';
 
 const FB = 'https://www.gstatic.com/firebasejs/10.12.2/';
 
-export async function createStore({ onCourses, onNotes, onAuth }) {
+export async function createStore({ onCourses, onNotes, onSubs = () => {}, onAuth }) {
   const cfg = self.LC_CONFIG || {};
-  return cfg.firebase ? firebaseStore(cfg, onCourses, onNotes, onAuth) : localStore(onCourses, onNotes, onAuth);
+  return cfg.firebase ? firebaseStore(cfg, onCourses, onNotes, onSubs, onAuth) : localStore(onCourses, onNotes, onSubs, onAuth);
 }
 
 function readJson(key, fallback) {
@@ -16,16 +16,18 @@ function writeJson(key, value) {
   try { localStorage.setItem(key, JSON.stringify(value)); } catch { /* 隱私模式等情況 */ }
 }
 
-function localStore(onCourses, onNotes, onAuth) {
+function localStore(onCourses, onNotes, onSubs, onAuth) {
   let courses = readJson('lc.courses', []);
   let notes = readJson('lc.notes', []);
+  let subs = readJson('lc.subs', []);
   const commit = () => { writeJson('lc.courses', courses); onCourses([...courses]); };
   const commitNotes = () => { writeJson('lc.notes', notes); onNotes([...notes]); };
+  const commitSubs = () => { writeJson('lc.subs', subs); onSubs([...subs]); };
   const upsert = (list, item) => {
     const i = list.findIndex(x => x.id === item.id);
     if (i >= 0) list[i] = item; else list.push(item);
   };
-  queueMicrotask(() => { onAuth({ local: true }); onCourses([...courses]); onNotes([...notes]); });
+  queueMicrotask(() => { onAuth({ local: true }); onCourses([...courses]); onNotes([...notes]); onSubs([...subs]); });
   return {
     mode: 'local',
     async signIn() {},
@@ -37,13 +39,16 @@ function localStore(onCourses, onNotes, onAuth) {
     async saveNote(n) { upsert(notes, n); commitNotes(); },
     async saveNotes(list) { list.forEach(n => upsert(notes, n)); commitNotes(); },
     async removeNote(id) { notes = notes.filter(n => n.id !== id); commitNotes(); },
+    async saveSub(s) { upsert(subs, s); commitSubs(); },
+    async saveSubs(list) { list.forEach(s => upsert(subs, s)); commitSubs(); },
+    async removeSub(id) { subs = subs.filter(s => s.id !== id); commitSubs(); },
     async getSettings() { return { ...DEFAULT_SETTINGS, ...readJson('lc.settings', {}) }; },
     async saveSettings(s) { writeJson('lc.settings', s); },
     async saveToken() { throw new Error('推播需要先完成雲端設定（見 SETUP.md）。'); }
   };
 }
 
-async function firebaseStore(cfg, onCourses, onNotes, onAuth) {
+async function firebaseStore(cfg, onCourses, onNotes, onSubs, onAuth) {
   const [appMod, authMod, fs] = await Promise.all([
     import(FB + 'firebase-app.js'),
     import(FB + 'firebase-auth.js'),
@@ -66,13 +71,15 @@ async function firebaseStore(cfg, onCourses, onNotes, onAuth) {
     if (user) {
       unsubscribers = [
         fs.onSnapshot(fs.collection(db, 'users', uid, 'courses'), snap => onCourses(snap.docs.map(d => d.data()))),
-        fs.onSnapshot(fs.collection(db, 'users', uid, 'notes'), snap => onNotes(snap.docs.map(d => d.data())))
+        fs.onSnapshot(fs.collection(db, 'users', uid, 'notes'), snap => onNotes(snap.docs.map(d => d.data()))),
+        fs.onSnapshot(fs.collection(db, 'users', uid, 'subs'), snap => onSubs(snap.docs.map(d => d.data())))
       ];
     }
   });
 
   const courseDoc = id => fs.doc(db, 'users', uid, 'courses', id);
   const noteDoc = id => fs.doc(db, 'users', uid, 'notes', id);
+  const subDoc = id => fs.doc(db, 'users', uid, 'subs', id);
   const userDoc = () => fs.doc(db, 'users', uid);
 
   return {
@@ -99,6 +106,15 @@ async function firebaseStore(cfg, onCourses, onNotes, onAuth) {
       }
     },
     removeNote: id => fs.deleteDoc(noteDoc(id)),
+    saveSub: s => fs.setDoc(subDoc(s.id), s),
+    async saveSubs(list) {
+      for (let i = 0; i < list.length; i += 400) {
+        const batch = fs.writeBatch(db);
+        list.slice(i, i + 400).forEach(s => batch.set(subDoc(s.id), s));
+        await batch.commit();
+      }
+    },
+    removeSub: id => fs.deleteDoc(subDoc(id)),
     async saveMany(list) {
       for (let i = 0; i < list.length; i += 400) {
         const batch = fs.writeBatch(db);
