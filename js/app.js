@@ -12,7 +12,7 @@ import { normalizeNote, normalizeAttachment, isNoteEmpty, parseTags, setupRichEd
 import {
   CURRENCIES, SUB_CATEGORIES, normalizeSub, isActive, nextCharge, paidCount, rateOf, toTwd, monthlyTwd,
   cycleLabel, priceText, computeSubAlerts, estimateTwd, chargeTwd, usesActual, chargeHistory, paidSummary, defaultFeePct,
-  subStatus, isPaused, periodStats, computeResumeAlerts, validatePeriods
+  subStatus, isPaused, periodStats, computeResumeAlerts, validatePeriods, accessEnd, willRenew, isEnding
 } from './subs.js';
 import { fetchTwdRates, RATE_REFRESH_MS } from './rates.js';
 import {
@@ -1611,21 +1611,29 @@ async function confirmResume(id) {
 function subSide(sub, today) {
   const status = subStatus(sub, today);
   const cur = lastOf(sub);
+  const until = accessEnd(sub, cur);
+  const what = cur.endType === 'pause' ? '暫停' : '取消';
   if (status === 'active') {
+    // 已申請取消／暫停，但已付的效期還沒到
+    if (isEnding(sub, today)) {
+      const left = dayDiff(today, until);
+      const short = until.slice(0, 4) === today.slice(0, 4) ? until.slice(5).replace('-', '/') : fmtDate(until);
+      return `<span class="when ending">效期到 ${short}</span><small>已${what}續訂・還能用 ${left} 天</small>`;
+    }
     const next = nextCharge(sub, today);
     if (!next) return '<span class="when muted">—</span>';
     const days = dayDiff(today, next);
-    const pauseSoon = cur.end && cur.end > today ? `<small>${fmtDate(cur.end)} 起${cur.endType === 'pause' ? '暫停' : '取消'}</small>` : `<small>${fmtDate(next)} 扣款</small>`;
-    return `<span class="when ${days <= 3 ? 'danger' : days <= 7 ? 'warn' : ''}">${whenText(days)}</span>${pauseSoon}`;
+    const note = cur.end && cur.end > today ? `<small>${fmtDate(cur.end)} 起${what}續訂</small>` : `<small>${fmtDate(next)} 扣款</small>`;
+    return `<span class="when ${days <= 3 ? 'danger' : days <= 7 ? 'warn' : ''}">${whenText(days)}</span>${note}`;
   }
   if (status === 'paused') {
     if (cur.resumeAt) {
       const d = dayDiff(today, cur.resumeAt);
       return `<span class="when paused">⏸ 暫停中</span><small>${d >= 0 ? `預計 ${fmtDate(cur.resumeAt)} 恢復` : `預計恢復日已過 ${-d} 天`}</small>`;
     }
-    return `<span class="when paused">⏸ 暫停中</span><small>${fmtDate(cur.end)} 起</small>`;
+    return `<span class="when paused">⏸ 暫停中</span><small>效期 ${fmtDate(until)} 結束</small>`;
   }
-  return `<span class="when muted">已取消</span><small>${fmtDate(cur.end)}</small>`;
+  return `<span class="when muted">已取消</span><small>效期 ${fmtDate(until)} 結束</small>`;
 }
 
 function subRow(sub, today) {
@@ -1679,8 +1687,11 @@ function renderSubs() {
   const active = all.filter(s => isActive(s, today));
   const paused = all.filter(s => isPaused(s, today));
   const cancelled = all.length - active.length - paused.length;
-  const monthly = sum(active, s => monthlyTwd(s, rates));
-  const pausedMonthly = sum(paused, s => monthlyTwd(s, rates));
+  // 每月花費只算之後還會續訂扣款的；已取消續訂（效期內仍可用）與暫停中的都算「少付」
+  const renewing = active.filter(s => willRenew(s, today));
+  const ending = active.length - renewing.length;
+  const monthly = sum(renewing, s => monthlyTwd(s, rates));
+  const pausedMonthly = sum([...paused, ...active.filter(s => !willRenew(s, today) && lastOf(s).endType === 'pause')], s => monthlyTwd(s, rates));
   const events = upcomingEvents(rates);
   const upcomingTotal = sum(events, e => e.amount);
   const soon = events.filter(x => x.daysUntil <= 7).length;
@@ -1693,7 +1704,7 @@ function renderSubs() {
   const overdue = computeResumeAlerts(all, new Date(), 0).filter(x => x.daysUntil < 0 || x.daysUntil === 0);
 
   const byCat = new Map();
-  for (const s of active) {
+  for (const s of renewing) {
     const k = s.category || '未分類';
     const g = byCat.get(k) || { key: k, count: 0, monthly: 0 };
     g.count++;
@@ -1707,13 +1718,19 @@ function renderSubs() {
     const sa = subStatus(a, today);
     const sb = subStatus(b, today);
     if (sa !== sb) return order[sa] - order[sb];
-    if (sa === 'active') return (nextCharge(a, today) || '').localeCompare(nextCharge(b, today) || '');
+    if (sa === 'active') {
+      // 會續訂的依下次扣款日，已停止續訂的排後面、依效期結束日
+      const ra = willRenew(a, today);
+      const rb = willRenew(b, today);
+      if (ra !== rb) return ra ? -1 : 1;
+      return ra ? (nextCharge(a, today) || '').localeCompare(nextCharge(b, today) || '') : accessEnd(a).localeCompare(accessEnd(b));
+    }
     return (lastOf(b).end || '').localeCompare(lastOf(a).end || '');
   });
 
   view.innerHTML = `
     <div class="stat-tiles">
-      <div class="tile"><small>每月約</small><strong>${money(monthly)}</strong><span>使用中 ${active.length} 項${paused.length ? `・暫停中 ${paused.length} 項，每月少付約 ${money(pausedMonthly)}` : '（年繳已平均到每月）'}</span></div>
+      <div class="tile"><small>每月約</small><strong>${money(monthly)}</strong><span>使用中 ${active.length} 項${ending ? `（${ending} 項已停止續訂，效期內仍可用）` : ''}${paused.length || pausedMonthly ? `・暫停${paused.length ? `中 ${paused.length} 項` : ''}，每月少付約 ${money(pausedMonthly)}` : (ending ? '' : '（年繳已平均到每月）')}</span></div>
       <div class="tile"><small>每年約</small><strong>${money(monthly * 12)}</strong><span>照目前使用中的訂閱持續一整年</span></div>
       <div class="tile"><small>未來 30 天將扣款</small><strong class="${soon ? 'warn' : ''}">${money(upcomingTotal)}</strong><span>${events.length} 筆${soon ? `・7 天內 ${soon} 筆` : ''}</span></div>
       <div class="tile"><small>累計已付</small><strong>${money(paidTotal)}</strong><span>${paidCountAll} 期中 ${actualCountAll} 期為實際金額${pauseSaved >= 1 ? `・暫停期間約省下 ${money(pauseSaved)}` : ''}${cancelled ? `・已取消 ${cancelled} 項` : ''}</span></div>
@@ -1753,7 +1770,7 @@ function renderSubs() {
           : '<p class="muted-text">未來 30 天沒有扣款 🎉</p>'}
       </div>
       <div class="panel">
-        <h2>${icon('chart')}依類別 <small>每月花費・使用中</small></h2>
+        <h2>${icon('chart')}依類別 <small>每月花費・會續訂的</small></h2>
         ${cats.length ? subBars(cats) : '<p class="muted-text">目前沒有使用中的訂閱</p>'}
       </div>
     </div>
@@ -1818,7 +1835,14 @@ function bindSubEditor() {
         const today = taipeiToday();
         if (p.endType && !p.end) p.end = today > p.start ? today : addDays(p.start, 1);
         renderPeriods();
-      } else renderPeriodBar();
+      } else {
+        renderPeriodBar();
+        // 只更新「效期到哪天」說明，不重畫欄位（避免打字時失去焦點）
+        $$('#sub-periods [data-pi]').forEach(row => {
+          const note = row.querySelector('.pr-note');
+          if (note) note.innerHTML = paidThroughText(Number(row.dataset.pi));
+        });
+      }
       renderChargeRows();
       updateSubPreview();
       return;
@@ -1905,10 +1929,11 @@ function renderPeriods() {
       </div>
       <div class="pr-fields">
         <label><span>${i === 0 ? '第一次扣款日' : '恢復（開始扣款）日'}</span><input type="date" name="p-start" value="${esc(p.start)}" required></label>
-        ${type !== 'active' ? `<label><span>${type === 'pause' ? '暫停日' : '取消日'}<small>這天起不再扣款</small></span><input type="date" name="p-end" value="${esc(p.end)}" required></label>` : ''}
+        ${type !== 'active' ? `<label><span>${type === 'pause' ? '申請暫停日' : '申請取消日'}<small>之後不再續訂扣款</small></span><input type="date" name="p-end" value="${esc(p.end)}" required></label>` : ''}
         ${type === 'pause' && last ? `<label><span>預計恢復日<small>選填</small></span><input type="date" name="p-resume" value="${esc(p.resumeAt)}"></label>` : ''}
         ${last ? '' : `<label><span>這段的金額</span><span class="money-mini"><em>${esc(sym)}</em><input type="number" name="p-price" min="0" step="0.01" inputmode="decimal" value="${esc(p.price)}"></span></label>`}
       </div>
+      ${type !== 'active' && p.end ? `<p class="pr-note">${paidThroughText(i)}</p>` : ''}
     </li>`;
   }).join('');
   renderPeriodActions();
@@ -1930,7 +1955,28 @@ function renderPeriodActions() {
   } else {
     buttons = `<button type="button" class="btn primary small" data-pact="resume">${icon('repeat')}重新訂閱</button>`;
   }
-  box.innerHTML = buttons + (last.end && last.end > today ? `<small class="muted-text">${fmtDate(last.end)} 起${last.endType === 'pause' ? '暫停' : '取消'}，在那之前仍會扣款</small>` : '');
+  box.innerHTML = buttons;
+}
+
+// 期間草稿 → 正規化的訂閱（日期不合理時回傳 null）
+function draftSub() {
+  const periods = draftPeriods();
+  if (!periods.every(p => /^\d{4}-\d{2}-\d{2}$/.test(p.start)) || validatePeriods(periods)) return null;
+  const form = $('#sub-form');
+  return normalizeSub({ name: 'x', cycle: form.cycle.value, every: form.every.value, ...mainPricing(), periods });
+}
+
+// 「已付的效期到哪天」說明
+function paidThroughText(i) {
+  const sub = draftSub();
+  const p = state.subPeriods[i];
+  if (!sub || !p?.end) return '';
+  const np = sub.periods.find(x => x.start === p.start);
+  const until = np ? accessEnd(sub, np) : '';
+  if (!until) return '';
+  const what = p.endType === 'pause' ? '暫停' : '取消';
+  if (p.end <= p.start) return `還沒開始扣款就${what}（例如試用期內），不會被扣款；可使用到 ${fmtDate(p.start)}`;
+  return `${fmtDate(p.end)} 申請${what}，不會再續訂；已付的這一期照常可用，<b>效期到 ${fmtDate(until)}</b>`;
 }
 
 function periodAction(kind) {
@@ -1946,7 +1992,10 @@ function periodAction(kind) {
     last.endType = 'cancel';
     last.resumeAt = '';
   } else if (kind === 'resume') {
-    let start = last.resumeAt && last.resumeAt >= last.end ? last.resumeAt : today;
+    // 預設從預計恢復日開始；沒有的話從「效期結束」或今天（較晚的）開始
+    const sub = draftSub();
+    const until = sub ? accessEnd(sub) : '';
+    let start = last.resumeAt && last.resumeAt >= last.end ? last.resumeAt : [today, until].filter(Boolean).sort().pop();
     if (last.end && start < last.end) start = last.end;
     last.resumeAt = '';
     // 上一段改用自己的價格保存，新的一段沿用目前金額
@@ -1967,14 +2016,22 @@ function renderPeriodBar() {
   const today = taipeiToday();
   const from = list[0].start;
   const lastP = list[list.length - 1];
-  const to = [today, lastP.end, lastP.resumeAt].filter(Boolean).sort().pop();
+  // 每段可使用到「效期結束」，之後才是暫停／取消
+  const sub = draftSub();
+  const untilOf = p => {
+    if (!p.end) return '';
+    const np = sub?.periods.find(x => x.start === p.start);
+    return np ? accessEnd(sub, np) : p.end;
+  };
+  const to = [today, untilOf(lastP), lastP.resumeAt].filter(Boolean).sort().pop();
   const total = Math.max(1, dayDiff(from, to));
   const segs = [];
   list.forEach((p, i) => {
-    const end = p.end || to;
-    segs.push({ cls: 'on', from: p.start, to: end });
     const next = list[i + 1];
-    if (p.end) segs.push({ cls: p.endType === 'pause' ? 'pause' : 'off', from: p.end, to: next ? next.start : to });
+    const until = untilOf(p);
+    const useEnd = [until || to, next ? next.start : ''].filter(Boolean).sort()[0];
+    segs.push({ cls: 'on', from: p.start, to: useEnd });
+    if (p.end) segs.push({ cls: p.endType === 'pause' ? 'pause' : 'off', from: useEnd, to: next ? next.start : to });
   });
   bar.hidden = list.length < 2 && !lastP.end;
   bar.innerHTML = `<div class="pb-track">${segs.filter(s => s.to > s.from).map(s => `<span class="pb-seg ${s.cls}" style="left:${dayDiff(from, s.from) / total * 100}%;width:${dayDiff(s.from, s.to) / total * 100}%" title="${fmtDate(s.from)} – ${fmtDate(s.to)}"></span>`).join('')}</div>
@@ -2039,14 +2096,18 @@ function updateSubPreview() {
       ? `每期約 ${money(chargeTwd(sub, rates))}（最近 ${Math.min(3, sub.charges.filter(c => c.date >= lastOf(sub).start).length)} 次實際平均）`
       : `每期估算 ${money(estimateTwd(sub, rates))}（${priceText(sub.price, sub.currency)} × 匯率 ${rateOf(sub.currency, rates)} × ${(1 + sub.feePct / 100).toFixed(3).replace(/0+$/, '')}）`);
   }
-  if (status === 'active') {
+  const cur = lastOf(sub);
+  const until = accessEnd(sub, cur);
+  if (status === 'active' && isEnding(sub, today)) {
+    parts.push(`已${cur.endType === 'pause' ? '暫停' : '取消'}續訂，不會再扣款；效期到 ${fmtDate(until)}（還能用 ${dayDiff(today, until)} 天）`);
+  } else if (status === 'active') {
     parts.push(`每月約 ${money(monthlyTwd(sub, rates))}`);
     parts.push(next ? `下次扣款 ${fmtDate(next)}（${whenText(dayDiff(today, next))}）` : '之後不會再扣款');
+    if (cur.end) parts.push(`${fmtDate(cur.end)} 起${cur.endType === 'pause' ? '暫停' : '取消'}續訂，效期到 ${fmtDate(until)}`);
   } else if (status === 'paused') {
-    const cur = lastOf(sub);
-    parts.push(cur.resumeAt ? `暫停中，預計 ${fmtDate(cur.resumeAt)} 恢復` : '暫停中，不會扣款');
+    parts.push(cur.resumeAt ? `暫停中，預計 ${fmtDate(cur.resumeAt)} 恢復` : `暫停中，效期 ${fmtDate(until)} 已結束，不會扣款`);
   } else {
-    parts.push('已取消，不會再扣款');
+    parts.push(`已取消，效期 ${fmtDate(until)} 已結束，不會再扣款`);
   }
   if (paid.count) parts.push(`至今已扣 ${paid.count} 次，共約 ${money(paid.total)}${paid.actualCount ? `（其中 ${paid.actualCount} 次為實際金額）` : ''}`);
   if (st.periods > 1 || st.pauses) {

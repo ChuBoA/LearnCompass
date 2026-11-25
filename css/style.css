@@ -772,4 +772,7 @@ dialog.viewer::backdrop { background: rgba(18, 14, 12, .6); }
 @media (max-width: 720px) {
   #sub-form .dlg-body { grid-template-columns: minmax(0, 1fr); }
   .pr-fields { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
-}
+}.when.ending { color: var(--warn); }
+.pr-note { margin: 8px 0 0; padding: 8px 10px; border-radius: 10px; background: color-mix(in srgb, var(--honey) 14%, transparent); font-size: 12.5px; line-height: 1.6; color: var(--ink); font-weight: 400; }
+.pr-note b { color: var(--warn); }.sub-row { grid-template-columns: 44px minmax(0, 1fr) auto 140px; }
+@media (max-width: 720px) { .sub-row { grid-template-columns: 40px minmax(0, 1fr) auto; } }

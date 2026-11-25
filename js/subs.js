@@ -44,7 +44,8 @@ function cleanFee(v, currency) {
 function normalizePeriod(p, fallback) {
   const currency = CURRENCIES[p.currency] ? p.currency : fallback.currency;
   const start = isDate(p.start) ? p.start : fallback.start;
-  const end = isDate(p.end) && p.end > start ? p.end : '';
+  // 結束日可以早於開始日：例如試用期內就取消，從頭到尾都不會扣款
+  const end = isDate(p.end) ? p.end : '';
   const endType = end ? (p.endType === 'pause' ? 'pause' : 'cancel') : '';
   return {
     start,
@@ -103,7 +104,6 @@ export function validatePeriods(periods) {
   for (let i = 0; i < list.length; i++) {
     const p = list[i];
     if (!isDate(p.start)) return `第 ${i + 1} 段缺少開始日`;
-    if (p.end && p.end <= p.start) return `第 ${i + 1} 段的結束日要晚於開始日`;
     if (i < list.length - 1) {
       if (!p.end) return `第 ${i + 1} 段後面還有期間，請填結束日（暫停或取消的那天）`;
       if (p.end > list[i + 1].start) return `第 ${i + 1} 段和第 ${i + 2} 段的日期重疊了`;
@@ -125,14 +125,29 @@ function normalizeCharges(list) {
 const monthsPerCharge = sub => (sub.cycle === 'year' ? 12 : 1) * (sub.every || 1);
 const lastPeriod = sub => sub.periods[sub.periods.length - 1];
 
-// 狀態：active 使用中、paused 暫停中、cancelled 已取消
+// 效期到哪天：訂閱是「先付款、用一整期」，提前取消或暫停只是不再續訂，已付的那一期照常可用。
+// 效期結束 = 取消（暫停）日之後、原本會扣下一次款的那天；還沒開始扣款就取消（試用期）則是第一次扣款日。
+export function accessEnd(sub, period = lastPeriod(sub)) {
+  if (!period.end) return '';
+  for (let k = 0; k < 2000; k++) {
+    const d = periodChargeDate(sub, period, k);
+    if (d >= period.end) return d;
+  }
+  return period.end;
+}
+
+// 狀態：active 使用中（含已取消續訂、效期還沒到）、paused 暫停中、cancelled 已取消
 export function subStatus(sub, today = taipeiToday()) {
   const cur = lastPeriod(sub);
-  if (!cur.end || cur.end > today) return 'active';
+  if (!cur.end || accessEnd(sub, cur) > today) return 'active';
   return cur.endType === 'pause' ? 'paused' : 'cancelled';
 }
 export const isActive = (sub, today) => subStatus(sub, today) === 'active';
 export const isPaused = (sub, today) => subStatus(sub, today) === 'paused';
+// 使用中，而且之後還會續訂扣款（已申請取消／暫停的不算）
+export const willRenew = (sub, today = taipeiToday()) => !lastPeriod(sub).end || lastPeriod(sub).end > today;
+// 已申請取消或暫停、但效期還沒到
+export const isEnding = (sub, today = taipeiToday()) => isActive(sub, today) && !willRenew(sub, today);
 
 // 某段期間的第 k 次扣款日：以這段開始日的「日」為錨點，遇到月底自動調整（1/31 → 2/28 → 3/31）
 function periodChargeDate(sub, period, k) {
@@ -231,12 +246,15 @@ export function periodStats(sub, today = taipeiToday(), rates) {
   let pauses = 0;
   let saved = 0;
   sub.periods.forEach((p, i) => {
-    if (p.start <= today) activeMonths += monthsBetween(p.start, p.end && p.end < today ? p.end : today);
+    const until = p.end ? accessEnd(sub, p) : '';
+    const next = sub.periods[i + 1];
+    // 可使用的期間：到效期結束（下一段提早開始就算到下一段）
+    const useEnd = [until || today, today, next ? next.start : ''].filter(Boolean).sort()[0];
+    if (p.start <= today) activeMonths += monthsBetween(p.start, useEnd);
     if (p.endType !== 'pause' || !p.end || p.end > today) return;
     pauses++;
-    const next = sub.periods[i + 1];
     const gapEnd = next && next.start <= today ? next.start : today;
-    pausedMonths += monthsBetween(p.end, gapEnd);
+    if (until < gapEnd) pausedMonths += monthsBetween(until, gapEnd);
     // 如果沒暫停，這段時間原本會扣幾次
     const missed = periodCharges(sub, { ...p, end: '' }, gapEnd, p.end).filter(d => d < gapEnd || !next).length;
     saved += missed * estimateTwd(sub, rates, p);
@@ -269,11 +287,11 @@ export function computeSubAlerts(subs, now = new Date(), withinDays = 30) {
     .sort((a, b) => a.date.localeCompare(b.date));
 }
 
-// 暫停中、有「預計恢復日」的訂閱；daysUntil < 0 表示預計日已過、還沒記錄恢復
+// 已申請暫停、有「預計恢復日」的訂閱；daysUntil < 0 表示預計日已過、還沒記錄恢復
 export function computeResumeAlerts(subs, now = new Date(), withinDays = 30) {
   const today = taipeiToday(now);
   return subs
-    .filter(sub => isPaused(sub, today) && lastPeriod(sub).resumeAt)
+    .filter(sub => lastPeriod(sub).endType === 'pause' && lastPeriod(sub).end <= today && lastPeriod(sub).resumeAt)
     .map(sub => ({ sub, date: lastPeriod(sub).resumeAt, daysUntil: dayDiff(today, lastPeriod(sub).resumeAt) }))
     .filter(x => x.daysUntil <= withinDays)
     .sort((a, b) => a.date.localeCompare(b.date));
