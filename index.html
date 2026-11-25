@@ -218,12 +218,7 @@
       <div class="dlg-body">
         <label class="field full">名稱<input name="name" required maxlength="100" placeholder="例如：ChatGPT Plus、Canva Pro"></label>
         <label class="field">類別<input name="category" list="dl-sub-category" maxlength="30"></label>
-        <label class="field">目前金額
-          <span class="money-input">
-            <select name="currency" aria-label="幣別"></select>
-            <input name="price" type="number" min="0" step="0.01" inputmode="decimal" required aria-label="金額">
-          </span>
-        </label>
+        <label class="field">幣別<select name="currency"></select></label>
         <label class="field">扣款週期
           <span class="money-input">
             <select name="every" aria-label="每幾個週期"></select>

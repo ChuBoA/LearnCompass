@@ -1904,11 +1904,12 @@ function bindSubEditor() {
   $('#sub-delete').addEventListener('click', deleteCurrentSub);
 }
 
-// 目前這段的價格、幣別、手續費以上方欄位為準
+// 幣別、手續費整個訂閱共用（上方欄位）；金額每段各自填
 function mainPricing() {
   const form = $('#sub-form');
-  return { price: form.price.value, currency: form.currency.value, feePct: form.feePct.value };
+  return { currency: form.currency.value, feePct: form.feePct.value };
 }
+const lastPrice = () => state.subPeriods[state.subPeriods.length - 1]?.price ?? '';
 
 // 從畫面讀回期間（存在 state.subPeriods）
 function collectPeriods() {
@@ -1950,7 +1951,7 @@ function extNoteText(pi, ei) {
 }
 
 function extRowHtml(p, pi, e, ei) {
-  const sym = (CURRENCIES[p.currency] || CURRENCIES.TWD).symbol;
+  const sym = (CURRENCIES[$('#sub-form').currency.value] || CURRENCIES.TWD).symbol;
   const gift = e.type === 'gift';
   return `<li class="ext-row ${gift ? 'gift' : 'buy'}" data-ei="${ei}">
     <div class="er-head"><b>${gift ? '🎁 序號贈送' : '➕ 疊加下訂'}</b>
@@ -1980,7 +1981,7 @@ function addExt(type) {
   } else {
     // 預設延長一期：從目前的到期日（下一次扣款日）再往後一期
     const base = (sub && (nextCharge(sub, today) || accessEnd(sub))) || today;
-    last.ext.push({ type: 'buy', date: today, until: sub ? addCycles(sub, base) : base, amount: mainPricing().price, note: '' });
+    last.ext.push({ type: 'buy', date: today, until: sub ? addCycles(sub, base) : base, amount: lastPrice(), note: '' });
   }
   refreshPeriodsUi();
   const rows = $$(`#sub-periods [data-pi="${list.length - 1}"] [data-ei]`);
@@ -1989,9 +1990,8 @@ function addExt(type) {
 }
 
 function draftPeriods() {
-  const list = state.subPeriods.map(p => ({ ...p }));
-  if (list.length) Object.assign(list[list.length - 1], mainPricing());
-  return list;
+  const shared = mainPricing();
+  return state.subPeriods.map(p => ({ ...p, ...shared }));
 }
 
 function refreshPeriodsUi() {
@@ -2004,11 +2004,11 @@ function renderPeriods() {
   const box = $('#sub-periods');
   const list = state.subPeriods;
   const many = list.length > 1;
-  $('#sub-periods-hint').textContent = many ? '每段各自從開始日推算扣款日；最後一段的金額以上方「目前金額」為準' : '第一次扣款日：免費試用請填試用結束、開始扣款那天';
+  $('#sub-periods-hint').textContent = many ? '每段各自從開始日推算扣款日，金額也各自填（漲價、換方案時不同）' : '第一次扣款日：免費試用請填試用結束、開始扣款那天';
+  const sym = (CURRENCIES[$('#sub-form').currency.value] || CURRENCIES.TWD).symbol;
   box.innerHTML = list.map((p, i) => {
     const last = i === list.length - 1;
     const type = p.endType || 'active';
-    const sym = (CURRENCIES[p.currency] || CURRENCIES.TWD).symbol;
     return `<li class="period-row ${type}" data-pi="${i}">
       <div class="pr-head">
         <b>${many ? `第 ${i + 1} 段` : '目前這段'}</b>
@@ -2021,9 +2021,9 @@ function renderPeriods() {
       </div>
       <div class="pr-fields">
         <label><span>${i === 0 ? '第一次扣款日' : '恢復（開始扣款）日'}</span><input type="date" name="p-start" value="${esc(p.start)}" required></label>
+        <label><span>每期金額</span><span class="money-mini"><em>${esc(sym)}</em><input type="number" name="p-price" min="0" step="0.01" inputmode="decimal" value="${esc(p.price)}" required></span></label>
         ${type !== 'active' ? `<label><span>${type === 'pause' ? '申請暫停日' : '申請取消日'}<small>之後不再續訂扣款</small></span><input type="date" name="p-end" value="${esc(p.end)}" required></label>` : ''}
         ${type === 'pause' && last ? `<label><span>預計恢復日<small>選填</small></span><input type="date" name="p-resume" value="${esc(p.resumeAt)}"></label>` : ''}
-        ${last ? '' : `<label><span>這段的金額</span><span class="money-mini"><em>${esc(sym)}</em><input type="number" name="p-price" min="0" step="0.01" inputmode="decimal" value="${esc(p.price)}"></span></label>`}
       </div>
       ${p.ext?.length ? `<ul class="ext-list">${p.ext.map((e, ei) => extRowHtml(p, i, e, ei)).join('')}</ul>` : ''}
       ${type !== 'active' && p.end ? `<p class="pr-note">${paidThroughText(i)}</p>` : ''}
@@ -2098,14 +2098,13 @@ function periodAction(kind) {
     let start = last.resumeAt && last.resumeAt >= last.end ? last.resumeAt : [today, until].filter(Boolean).sort().pop();
     if (last.end && start < last.end) start = last.end;
     last.resumeAt = '';
-    // 上一段改用自己的價格保存，新的一段沿用目前金額
-    Object.assign(last, mainPricing());
-    list.push({ start, end: '', endType: '', resumeAt: '', ...mainPricing() });
+    // 新的一段預設沿用上一段的金額，可以直接改
+    list.push({ start, end: '', endType: '', resumeAt: '', price: last.price, ...mainPricing() });
   }
   refreshPeriodsUi();
-  const focusName = kind === 'resume' ? 'p-start' : 'p-end';
+  const focusName = kind === 'resume' ? 'p-price' : 'p-end';
   $(`#sub-periods [data-pi="${list.length - 1}"] [name=${focusName}]`)?.focus();
-  toast({ pause: '已設為暫停，請確認暫停日；可選填預計恢復日', cancel: '已設為取消，請確認取消日', resume: '已新增一段期間，請確認恢復日與目前金額', 'to-cancel': '已改成取消' }[kind]);
+  toast({ pause: '已設為暫停，請確認暫停日；可選填預計恢復日', cancel: '已設為取消，請確認取消日', resume: '已新增一段期間，請確認恢復日與這段的每期金額', 'to-cancel': '已改成取消' }[kind]);
 }
 
 // 期間橫條：有訂閱的時段上色，暫停斜線，取消灰色
@@ -2160,7 +2159,7 @@ function chargesFromForm(old) {
   return [...kept, ...[...shown].filter(([, twd]) => twd > 0).map(([date, twd]) => ({ date, twd }))];
 }
 
-const formReady = () => $('#sub-form').price.value !== '' && state.subPeriods.some(p => p.start);
+const formReady = () => String(lastPrice()) !== '' && state.subPeriods.some(p => p.start);
 
 // 編輯視窗：列出最近 12 期，可以填實際扣款金額
 function renderChargeRows() {
@@ -2227,7 +2226,7 @@ function openSubEditor(id) {
   const form = $('#sub-form');
   form.reset();
   const s = sub || { currency: 'TWD', cycle: 'month', every: 1 };
-  for (const key of ['name', 'category', 'price', 'currency', 'cycle', 'every', 'link', 'note']) {
+  for (const key of ['name', 'category', 'currency', 'cycle', 'every', 'link', 'note']) {
     form[key].value = s[key] ?? '';
   }
   form.feePct.value = sub ? sub.feePct : defaultFeePct(s.currency);
