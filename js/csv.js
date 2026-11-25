@@ -58,18 +58,27 @@ export function extractSessions(note, purchaseDate) {
   return sessions;
 }
 
-// "2026-11-02 20:30 第一周; ..." ⇄ [{at, label}]
+// 場次連結（直播網址、教室地圖）：沒寫 http(s):// 的網址自動補上 https://
+export function sessionLink(value) {
+  const v = String(value || '').trim();
+  if (!v) return '';
+  if (/^https?:\/\//i.test(v)) return v.slice(0, 1000);
+  return /^[\w-]+(\.[\w-]+)+([\/?#].*)?$/.test(v) ? ('https://' + v).slice(0, 1000) : '';
+}
+
+// "2026-11-02 20:30 第一周 https://…; ..." ⇄ [{at, label, link}]（連結放在最後，可省略）
 function parseSessionsField(value) {
   return String(value || '').split(/[;；\n]/).map(s => s.trim()).filter(Boolean).map(s => {
     const m = s.match(/^(\d{4}[\/\-]\d{1,2}[\/\-]\d{1,2})(?:[ T](\d{1,2}:\d{2}))?\s*(.*)$/);
     if (!m) return null;
     const time = m[2] ? 'T' + m[2].padStart(5, '0') : '';
-    return { at: normalizeDate(m[1]) + time, label: m[3] || '' };
+    const rest = (m[3] || '').match(/^(.*?)\s*(https?:\/\/\S+)?$/);
+    return { at: normalizeDate(m[1]) + time, label: rest[1] || '', link: rest[2] || '' };
   }).filter(Boolean);
 }
 
 function formatSessionsField(sessions) {
-  return (sessions || []).map(s => `${s.at.replace('T', ' ')}${s.label ? ' ' + s.label : ''}`).join('; ');
+  return (sessions || []).map(s => `${s.at.replace('T', ' ')}${s.label ? ' ' + s.label : ''}${s.link ? ' ' + s.link : ''}`).join('; ');
 }
 
 export function newId() {
@@ -90,7 +99,7 @@ export function normalizeCourse(c) {
     accessUntil: normalizeDate(c.accessUntil),
     energy: Math.min(100, Math.max(0, Math.round(Number(c.energy) || 0))),
     link: String(c.link || '').trim(),
-    sessions: (c.sessions || []).filter(s => s && s.at).map(s => ({ at: s.at, label: s.label || '' })),
+    sessions: (c.sessions || []).filter(s => s && s.at).map(s => ({ at: s.at, label: s.label || '', link: sessionLink(s.link) })),
     lastStudiedAt: c.lastStudiedAt || null,
     createdAt: c.createdAt || now,
     updatedAt: c.updatedAt || now

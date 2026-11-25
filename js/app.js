@@ -1,5 +1,5 @@
 import { createStore, getPushToken } from './store.js';
-import { csvToCourses, coursesToCsv, mergeImport, normalizeCourse, newId } from './csv.js';
+import { csvToCourses, coursesToCsv, mergeImport, normalizeCourse, newId, sessionLink } from './csv.js';
 import {
   DEFAULT_SETTINGS, computeAlerts, courseStatus, daysLeft, upcomingSessions,
   formatSession, taipeiToday, idleDays, dayDiff
@@ -67,6 +67,11 @@ const fmtDate = d => (d ? d.replace(/-/g, '/') : '');
 const safeUrl = u => (/^https?:\/\//i.test(u || '') ? u : '');
 const linkify = text => esc(text).replace(/https?:\/\/[^\s<]+/g, url => `<a href="${url}" target="_blank" rel="noopener">${url}</a>`);
 const icon = name => `<svg class="i"><use href="#i-${name}"/></svg>`;
+// 場次的「上課連結」按鈕
+const sessionLinkBtn = (session, cls = 'btn dark small') => {
+  const link = safeUrl(session?.link);
+  return link ? `<a class="${cls}" data-action="go" href="${esc(link)}" target="_blank" rel="noopener">上課連結${icon('arrow')}</a>` : '';
+};
 const sum = (arr, f) => arr.reduce((t, x) => t + (f(x) || 0), 0);
 const emojiOf = cat => CATEGORY_EMOJI[cat] || '📚';
 
@@ -533,7 +538,10 @@ function renderHero() {
         <div class="ring-wrap">${energyRing(avg)}<b>${avg}<em>%</em></b></div>
         <div><small>平均學習能量</small><span>已完成 ${done} 門</span></div>
       </div>
-      <button type="button" class="tile-next" data-action="tab" data-tab="alerts">${next}</button>
+      <div class="tile-next-wrap">
+        <button type="button" class="tile-next" data-action="tab" data-tab="alerts">${next}</button>
+        ${s ? sessionLinkBtn(s.session, 'btn dark small hero-link') : ''}
+      </div>
     </div>`;
 }
 
@@ -600,7 +608,7 @@ function courseCard(c, today, noteCount = 0) {
     </div>
     <h3>${esc(c.name)}</h3>
     ${c.note ? `<p class="note" title="點一下展開">${linkify(c.note)}</p>` : ''}
-    ${next ? `<p class="next-session">${icon('cal')}<span>下次上課 <b>${formatSession(next.at)}</b> ${esc(next.label)}</span></p>` : ''}
+    ${next ? `<p class="next-session">${icon('cal')}<span>下次上課 <b>${formatSession(next.at)}</b> ${esc(next.label)}</span>${sessionLinkBtn(next, 'ns-link')}</p>` : ''}
     <div class="meta">
       <span>${icon('user')}${esc(c.teacher || '—')}</span>
       <span>${icon('globe')}${esc(c.platform || '—')}</span>
@@ -1174,8 +1182,10 @@ function emptyState() {
   </div>`;
 }
 
-function alertItem(c, sideHtml, extra = '') {
+function alertItem(c, sideHtml, extra = '', session = null) {
   const link = safeUrl(c.link);
+  // 場次有自己的連結就優先顯示「上課連結」，課程網址改成次要按鈕
+  const sLink = sessionLinkBtn(session);
   return `<li class="alert-item">
     <div class="alert-main">
       <strong>${esc(c.name)}</strong>
@@ -1183,7 +1193,8 @@ function alertItem(c, sideHtml, extra = '') {
     </div>
     <div class="alert-side">${sideHtml}</div>
     <div class="alert-actions">
-      ${link ? `<a class="btn dark small" data-action="go" href="${esc(link)}" target="_blank" rel="noopener">前往${icon('arrow')}</a>` : ''}
+      ${sLink}
+      ${link && !sLink ? `<a class="btn dark small" data-action="go" href="${esc(link)}" target="_blank" rel="noopener">前往${icon('arrow')}</a>` : ''}
       <button class="btn soft small icon-only" type="button" data-action="edit" data-id="${esc(c.id)}" aria-label="編輯">${icon('edit')}</button>
     </div>
   </li>`;
@@ -1200,7 +1211,7 @@ function renderAlerts(alerts) {
       <h2>${icon('cal')}即將上課 <small>未來 14 天</small></h2>
       ${sessions.length ? `<ul class="alert-list">${sessions.map(({ course, session, daysUntil }) =>
         alertItem(course, `<span class="when ${daysUntil <= 1 ? 'danger' : ''}">${dayText(daysUntil)}</span><small>${formatSession(session.at)}</small>`,
-          session.label ? `・${esc(session.label)}` : '')).join('')}</ul>`
+          session.label ? `・${esc(session.label)}` : '', session)).join('')}</ul>`
         : '<p class="muted-text">近期沒有直播或實體課。可在課程的「編輯」中新增上課場次。</p>'}
     </div>
     <div class="panel">
@@ -1490,7 +1501,8 @@ function addSessionRow(session, focus = false) {
   row.innerHTML = `
     <input type="datetime-local" value="${esc(session.at.length === 10 ? session.at + 'T00:00' : session.at)}" aria-label="上課時間">
     <input type="text" value="${esc(session.label)}" placeholder="說明（例如：第一週）" aria-label="場次說明">
-    <button type="button" class="btn plain icon-only" data-remove aria-label="移除場次">${icon('x')}</button>`;
+    <button type="button" class="btn plain icon-only" data-remove aria-label="移除場次">${icon('x')}</button>
+    <input type="text" class="session-link" inputmode="url" value="${esc(session.link || '')}" placeholder="連結（選填）：直播網址、教室地圖" aria-label="場次連結">`;
   $('#sessions').append(row);
   if (focus) row.querySelector('input').focus();
 }
@@ -1518,8 +1530,8 @@ async function submitEditor(e) {
   const now = new Date().toISOString();
   const energy = Number(form.energy.value);
   const sessions = $$('#sessions .session-row').map(r => {
-    const [at, label] = r.querySelectorAll('input');
-    return { at: at.value, label: label.value.trim() };
+    const [at, label, link] = r.querySelectorAll('input');
+    return { at: at.value, label: label.value.trim(), link: sessionLink(link.value) };
   }).filter(s => s.at).sort((a, b) => a.at.localeCompare(b.at));
   const course = {
     ...(old || { id: newId(), createdAt: now }),
