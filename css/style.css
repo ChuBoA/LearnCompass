@@ -776,3 +776,14 @@ dialog.viewer::backdrop { background: rgba(18, 14, 12, .6); }
 .pr-note { margin: 8px 0 0; padding: 8px 10px; border-radius: 10px; background: color-mix(in srgb, var(--honey) 14%, transparent); font-size: 12.5px; line-height: 1.6; color: var(--ink); font-weight: 400; }
 .pr-note b { color: var(--warn); }.sub-row { grid-template-columns: 44px minmax(0, 1fr) auto 140px; }
 @media (max-width: 720px) { .sub-row { grid-template-columns: 40px minmax(0, 1fr) auto; } }
+/* 疊加下訂、序號贈送 */
+.ext-list { list-style: none; margin: 10px 0 0; padding: 0; display: grid; gap: 8px; }
+.ext-row { border: 1px dashed var(--line); border-radius: 12px; padding: 8px 10px; background: var(--surface-2); }
+.ext-row.gift { border-color: color-mix(in srgb, var(--honey) 60%, var(--line)); }
+.er-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+.er-head b { flex: 1; font-size: 12.5px; }
+.ext-row .pr-fields input { background: var(--surface); }
+.ext-row .er-note-field { grid-column: 1 / -1; }
+.ext-note { background: color-mix(in srgb, var(--sage) 14%, transparent); }
+.ext-note b { color: var(--ink); }
+.pb-seg.gift, .pb-legend i.gift { background: repeating-linear-gradient(135deg, var(--honey) 0 4px, color-mix(in srgb, var(--honey) 55%, transparent) 4px 8px); }

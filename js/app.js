@@ -12,7 +12,8 @@ import { normalizeNote, normalizeAttachment, isNoteEmpty, parseTags, setupRichEd
 import {
   CURRENCIES, SUB_CATEGORIES, normalizeSub, isActive, nextCharge, paidCount, rateOf, toTwd, monthlyTwd,
   cycleLabel, priceText, computeSubAlerts, estimateTwd, chargeTwd, usesActual, chargeHistory, paidSummary, defaultFeePct,
-  subStatus, isPaused, periodStats, computeResumeAlerts, validatePeriods, accessEnd, willRenew, isEnding
+  subStatus, isPaused, periodStats, computeResumeAlerts, validatePeriods, accessEnd, willRenew, isEnding,
+  extSpans, addCycles
 } from './subs.js';
 import { fetchTwdRates, RATE_REFRESH_MS } from './rates.js';
 import {
@@ -1642,6 +1643,7 @@ function subRow(sub, today) {
   const stats = periodStats(sub, today, subRates());
   const extra = [`累計 ${paidCount(sub, today)} 次`];
   if (stats.pauses) extra.push(`暫停 ${stats.pauses} 次`);
+  if (stats.giftDays) extra.push(`贈送 ${stats.giftDays} 天`);
   if (sub.feePct > 0) extra.push(`手續費 ${sub.feePct}%`);
   return `<li>
     <button type="button" class="sub-row ${status}" data-action="edit-sub" data-id="${esc(sub.id)}" style="--h:${h}">
@@ -1699,7 +1701,10 @@ function renderSubs() {
   const paidTotal = sum(paid, p => p.total);
   const paidCountAll = sum(paid, p => p.count);
   const actualCountAll = sum(paid, p => p.actualCount);
-  const pauseSaved = sum(all, s => periodStats(s, today, rates).saved);
+  const allStats = all.map(s => periodStats(s, today, rates));
+  const pauseSaved = sum(allStats, st => st.saved);
+  const giftValue = sum(allStats, st => st.giftValue);
+  const giftDays = sum(allStats, st => st.giftDays);
   const pending = pendingCharges(today);
   const overdue = computeResumeAlerts(all, new Date(), 0).filter(x => x.daysUntil < 0 || x.daysUntil === 0);
 
@@ -1733,7 +1738,7 @@ function renderSubs() {
       <div class="tile"><small>每月約</small><strong>${money(monthly)}</strong><span>使用中 ${active.length} 項${ending ? `（${ending} 項已停止續訂，效期內仍可用）` : ''}${paused.length || pausedMonthly ? `・暫停${paused.length ? `中 ${paused.length} 項` : ''}，每月少付約 ${money(pausedMonthly)}` : (ending ? '' : '（年繳已平均到每月）')}</span></div>
       <div class="tile"><small>每年約</small><strong>${money(monthly * 12)}</strong><span>照目前使用中的訂閱持續一整年</span></div>
       <div class="tile"><small>未來 30 天將扣款</small><strong class="${soon ? 'warn' : ''}">${money(upcomingTotal)}</strong><span>${events.length} 筆${soon ? `・7 天內 ${soon} 筆` : ''}</span></div>
-      <div class="tile"><small>累計已付</small><strong>${money(paidTotal)}</strong><span>${paidCountAll} 期中 ${actualCountAll} 期為實際金額${pauseSaved >= 1 ? `・暫停期間約省下 ${money(pauseSaved)}` : ''}${cancelled ? `・已取消 ${cancelled} 項` : ''}</span></div>
+      <div class="tile"><small>累計已付</small><strong>${money(paidTotal)}</strong><span>${paidCountAll} 期中 ${actualCountAll} 期為實際金額${pauseSaved >= 1 ? `・暫停期間約省下 ${money(pauseSaved)}` : ''}${giftDays ? `・序號贈送 ${giftDays} 天，約值 ${money(giftValue)}` : ''}${cancelled ? `・已取消 ${cancelled} 項` : ''}</span></div>
     </div>
 
     ${overdue.length ? `<div class="panel pending-panel">
@@ -1750,7 +1755,7 @@ function renderSubs() {
       <h2>${icon('edit')}最近扣款，填上實際金額 <small>選填・照信用卡帳單（含手續費）</small></h2>
       <ul class="charge-pending">${pending.map(p => `
         <li data-charge data-id="${esc(p.sub.id)}" data-date="${p.date}">
-          <span class="cp-main"><strong>${esc(p.sub.name)}</strong><small>${fmtDate(p.date)} 扣款・估算 ${money(p.estimate)}</small></span>
+          <span class="cp-main"><strong>${esc(p.sub.name)}</strong><small>${fmtDate(p.date)} ${p.kind === 'buy' ? '疊加下訂' : '扣款'}・估算 ${money(p.estimate)}</small></span>
           <label class="cp-input"><span>NT$</span><input type="number" min="0" step="1" inputmode="decimal" placeholder="${Math.round(p.estimate)}" aria-label="${esc(p.sub.name)} 實際扣款金額"></label>
           <button type="button" class="btn primary small" data-action="record-charge">記錄</button>
         </li>`).join('')}</ul>
@@ -1839,9 +1844,13 @@ function bindSubEditor() {
         renderPeriodBar();
         // 只更新「效期到哪天」說明，不重畫欄位（避免打字時失去焦點）
         $$('#sub-periods [data-pi]').forEach(row => {
-          const note = row.querySelector('.pr-note');
+          const note = row.querySelector(':scope > .pr-note');
           if (note) note.innerHTML = paidThroughText(Number(row.dataset.pi));
+          row.querySelectorAll('[data-ei]').forEach(er => {
+            er.querySelector('.ext-note').innerHTML = extNoteText(Number(row.dataset.pi), Number(er.dataset.ei));
+          });
         });
+        renderPeriodActions();
       }
       renderChargeRows();
       updateSubPreview();
@@ -1861,6 +1870,16 @@ function bindSubEditor() {
     if (btn) periodAction(btn.dataset.pact);
   });
   $('#sub-periods').addEventListener('click', e => {
+    const ebtn = e.target.closest('[data-eremove]');
+    if (ebtn) {
+      collectPeriods();
+      const [pi, ei] = ebtn.dataset.eremove.split(':').map(Number);
+      const ext = state.subPeriods[pi]?.ext;
+      if (!ext?.[ei] || !confirm(`刪除這筆${ext[ei].type === 'gift' ? '序號贈送' : '疊加下訂'}？`)) return;
+      ext.splice(ei, 1);
+      refreshPeriodsUi();
+      return;
+    }
     const btn = e.target.closest('[data-premove]');
     if (!btn) return;
     collectPeriods();
@@ -1892,8 +1911,69 @@ function collectPeriods() {
     p.resumeAt = type === 'pause' ? (row.querySelector('[name=p-resume]')?.value || '') : '';
     const price = row.querySelector('[name=p-price]');
     if (price) p.price = price.value;
+    row.querySelectorAll('[data-ei]').forEach(er => {
+      const e = (p.ext || [])[Number(er.dataset.ei)];
+      if (!e) return;
+      const val = n => er.querySelector(`[name=${n}]`)?.value ?? '';
+      e.date = val('e-date');
+      e.note = val('e-note');
+      if (e.type === 'gift') e.days = val('e-days');
+      else { e.until = val('e-until'); e.amount = val('e-amount'); }
+    });
   });
   return state.subPeriods;
+}
+
+// 某筆延長實際延了多久（用正規化後的草稿算）
+function extNoteText(pi, ei) {
+  const sub = draftSub();
+  const p = state.subPeriods[pi];
+  const e = p?.ext?.[ei];
+  if (!sub || !e) return '';
+  const np = sub.periods.find(x => x.start === p.start);
+  const span = np ? extSpans(sub, np).find(s => s.ext.date === e.date && s.ext.type === e.type) : null;
+  if (!span) return '日期在這段期間的效期之後，不會影響扣款';
+  if (e.type === 'gift') return `${fmtDate(span.from)} 的扣款延到 <b>${fmtDate(span.to)}</b>`;
+  return `原本 ${fmtDate(span.from)} 的扣款延到 <b>${fmtDate(span.to)}</b>，多 ${dayDiff(span.from, span.to)} 天`;
+}
+
+function extRowHtml(p, pi, e, ei) {
+  const sym = (CURRENCIES[p.currency] || CURRENCIES.TWD).symbol;
+  const gift = e.type === 'gift';
+  return `<li class="ext-row ${gift ? 'gift' : 'buy'}" data-ei="${ei}">
+    <div class="er-head"><b>${gift ? '🎁 序號贈送' : '➕ 疊加下訂'}</b>
+      <button type="button" class="btn quiet small icon-only" data-eremove="${pi}:${ei}" aria-label="刪除這筆" title="刪除這筆">${icon('trash')}</button></div>
+    <div class="pr-fields">
+      <label><span>${gift ? '兌換日' : '下訂日'}</span><input type="date" name="e-date" value="${esc(e.date)}" required></label>
+      ${gift
+        ? `<label><span>贈送天數</span><input type="number" name="e-days" min="1" max="3650" step="1" inputmode="numeric" value="${esc(e.days)}" required></label>`
+        : `<label><span>實付金額</span><span class="money-mini"><em>${esc(sym)}</em><input type="number" name="e-amount" min="0" step="0.01" inputmode="decimal" value="${esc(e.amount)}"></span></label>
+           <label><span>延長到<small>新的到期日</small></span><input type="date" name="e-until" value="${esc(e.until)}" required></label>`}
+      <label class="er-note-field"><span>備註<small>選填</small></span><input type="text" name="e-note" maxlength="200" value="${esc(e.note || '')}" placeholder="${gift ? '例如：序號來源' : '例如：年度優惠'}"></label>
+    </div>
+    <p class="pr-note ext-note">${extNoteText(pi, ei)}</p>
+  </li>`;
+}
+
+// 疊加下訂／序號贈送：加在最後一段
+function addExt(type) {
+  collectPeriods();
+  const list = state.subPeriods;
+  const last = list[list.length - 1];
+  const today = taipeiToday();
+  const sub = draftSub();
+  last.ext = last.ext || [];
+  if (type === 'gift') {
+    last.ext.push({ type: 'gift', date: today, days: 30, note: '' });
+  } else {
+    // 預設延長一期：從目前的到期日（下一次扣款日）再往後一期
+    const base = (sub && (nextCharge(sub, today) || accessEnd(sub))) || today;
+    last.ext.push({ type: 'buy', date: today, until: sub ? addCycles(sub, base) : base, amount: mainPricing().price, note: '' });
+  }
+  refreshPeriodsUi();
+  const rows = $$(`#sub-periods [data-pi="${list.length - 1}"] [data-ei]`);
+  rows[rows.length - 1]?.querySelector(type === 'gift' ? '[name=e-days]' : '[name=e-until]')?.focus();
+  toast(type === 'gift' ? '請確認兌換日與贈送天數' : '請確認下訂日、實付金額與新的到期日');
 }
 
 function draftPeriods() {
@@ -1933,6 +2013,7 @@ function renderPeriods() {
         ${type === 'pause' && last ? `<label><span>預計恢復日<small>選填</small></span><input type="date" name="p-resume" value="${esc(p.resumeAt)}"></label>` : ''}
         ${last ? '' : `<label><span>這段的金額</span><span class="money-mini"><em>${esc(sym)}</em><input type="number" name="p-price" min="0" step="0.01" inputmode="decimal" value="${esc(p.price)}"></span></label>`}
       </div>
+      ${p.ext?.length ? `<ul class="ext-list">${p.ext.map((e, ei) => extRowHtml(p, i, e, ei)).join('')}</ul>` : ''}
       ${type !== 'active' && p.end ? `<p class="pr-note">${paidThroughText(i)}</p>` : ''}
     </li>`;
   }).join('');
@@ -1954,6 +2035,12 @@ function renderPeriodActions() {
       <button type="button" class="btn ghost small" data-pact="to-cancel">改成取消</button>`;
   } else {
     buttons = `<button type="button" class="btn primary small" data-pact="resume">${icon('repeat')}重新訂閱</button>`;
+  }
+  // 還在效期內才能疊加下訂或兌換序號
+  const sub = draftSub();
+  if (!last.endType || (sub && isActive(sub, today))) {
+    buttons += `<button type="button" class="btn ghost small" data-pact="buy">➕ 疊加下訂</button>
+      <button type="button" class="btn ghost small" data-pact="gift">🎁 序號贈送</button>`;
   }
   box.innerHTML = buttons;
 }
@@ -1980,6 +2067,7 @@ function paidThroughText(i) {
 }
 
 function periodAction(kind) {
+  if (kind === 'buy' || kind === 'gift') { addExt(kind); return; }
   collectPeriods();
   const list = state.subPeriods;
   const last = list[list.length - 1];
@@ -2023,7 +2111,9 @@ function renderPeriodBar() {
     const np = sub?.periods.find(x => x.start === p.start);
     return np ? accessEnd(sub, np) : p.end;
   };
-  const to = [today, untilOf(lastP), lastP.resumeAt].filter(Boolean).sort().pop();
+  // 序號贈送延長的時段
+  const gifts = (sub?.periods || []).flatMap(p => extSpans(sub, p)).filter(s => s.type === 'gift' && s.ext.date <= today);
+  const to = [today, untilOf(lastP), lastP.resumeAt, ...gifts.map(g => g.to)].filter(Boolean).sort().pop();
   const total = Math.max(1, dayDiff(from, to));
   const segs = [];
   list.forEach((p, i) => {
@@ -2033,9 +2123,10 @@ function renderPeriodBar() {
     segs.push({ cls: 'on', from: p.start, to: useEnd });
     if (p.end) segs.push({ cls: p.endType === 'pause' ? 'pause' : 'off', from: useEnd, to: next ? next.start : to });
   });
-  bar.hidden = list.length < 2 && !lastP.end;
-  bar.innerHTML = `<div class="pb-track">${segs.filter(s => s.to > s.from).map(s => `<span class="pb-seg ${s.cls}" style="left:${dayDiff(from, s.from) / total * 100}%;width:${dayDiff(s.from, s.to) / total * 100}%" title="${fmtDate(s.from)} – ${fmtDate(s.to)}"></span>`).join('')}</div>
-    <div class="pb-labels"><span>${fmtDate(from)}</span><span class="pb-legend"><i class="on"></i>訂閱 <i class="pause"></i>暫停 <i class="off"></i>取消</span><span>${fmtDate(to)}</span></div>`;
+  for (const g of gifts) segs.push({ cls: 'gift', from: g.from, to: g.to, title: `序號贈送 ${g.ext.days} 天` });
+  bar.hidden = list.length < 2 && !lastP.end && !gifts.length;
+  bar.innerHTML = `<div class="pb-track">${segs.filter(s => s.to > s.from).map(s => `<span class="pb-seg ${s.cls}" style="left:${dayDiff(from, s.from) / total * 100}%;width:${dayDiff(s.from, s.to) / total * 100}%" title="${s.title ? s.title + '・' : ''}${fmtDate(s.from)} – ${fmtDate(s.to)}"></span>`).join('')}</div>
+    <div class="pb-labels"><span>${fmtDate(from)}</span><span class="pb-legend"><i class="on"></i>訂閱 ${gifts.length ? '<i class="gift"></i>贈送 ' : ''}<i class="pause"></i>暫停 <i class="off"></i>取消</span><span>${fmtDate(to)}</span></div>`;
 }
 
 function subFromForm() {
@@ -2070,7 +2161,7 @@ function renderChargeRows() {
   box.innerHTML = hist.map(h => {
     const value = typed.has(h.date) ? typed.get(h.date) : (h.actual ?? '');
     return `<li data-date="${h.date}">
-      <span class="cl-date">${fmtDate(h.date)}${sub.periods.length > 1 ? `<small>第 ${h.period + 1} 段</small>` : ''}</span>
+      <span class="cl-date">${fmtDate(h.date)}${h.kind === 'buy' ? '<small>疊加下訂</small>' : sub.periods.length > 1 ? `<small>第 ${h.period + 1} 段</small>` : ''}</span>
       <span class="cl-est">估算 ${money(h.estimate)}</span>
       <label class="cp-input"><span>NT$</span><input type="number" min="0" step="1" inputmode="decimal" value="${esc(value)}" placeholder="實際金額" aria-label="${fmtDate(h.date)} 實際扣款"></label>
     </li>`;
@@ -2110,6 +2201,8 @@ function updateSubPreview() {
     parts.push(`已取消，效期 ${fmtDate(until)} 已結束，不會再扣款`);
   }
   if (paid.count) parts.push(`至今已扣 ${paid.count} 次，共約 ${money(paid.total)}${paid.actualCount ? `（其中 ${paid.actualCount} 次為實際金額）` : ''}`);
+  if (st.buys) parts.push(`疊加下訂 ${st.buys} 次`);
+  if (st.gifts) parts.push(`序號贈送 ${st.gifts} 次、共 ${st.giftDays} 天，約值 ${money(st.giftValue)}`);
   if (st.periods > 1 || st.pauses) {
     parts.push(`共訂閱 ${fmtMonths(st.activeMonths)}${st.pauses ? `、暫停 ${st.pauses} 次（共 ${fmtMonths(st.pausedMonths)}）` : ''}${st.saved >= 1 ? `，暫停期間約省下 ${money(st.saved)}` : ''}`);
   }

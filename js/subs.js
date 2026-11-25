@@ -7,6 +7,11 @@
 //   - endType：'pause' 暫停（之後可能恢復）、'cancel' 取消
 //   - resumeAt：暫停時選填的預計恢復日
 //   - price／currency／feePct：這段期間的價格（漲價、換方案時各段不同）
+//   - ext：這段期間內的延長紀錄，依日期排序
+//       { type: 'buy',  date: 下訂日, until: 延長到哪天, amount: 實付金額（這段的幣別）, note }
+//         還沒到期就再次下訂：效期疊加，下一次扣款直接延到 until
+//       { type: 'gift', date: 兌換日, days: 贈送天數, note }
+//         輸入序號贈送：下一次扣款往後延 days 天，不用付錢
 // 最上層的 price、currency、feePct、startDate、cancelledAt 會同步成「目前這段」的值，方便相容舊資料。
 import { taipeiToday, dayDiff, DEFAULT_SETTINGS } from './reminders.js';
 
@@ -54,8 +59,37 @@ function normalizePeriod(p, fallback) {
     resumeAt: endType === 'pause' && isDate(p.resumeAt) && p.resumeAt > end ? p.resumeAt : '',
     price: p.price === undefined || p.price === '' ? fallback.price : money2(p.price),
     currency,
-    feePct: cleanFee(p.feePct ?? (currency === fallback.currency ? fallback.feePct : undefined), currency)
+    feePct: cleanFee(p.feePct ?? (currency === fallback.currency ? fallback.feePct : undefined), currency),
+    ext: normalizeExt(p.ext)
   };
+}
+
+function normalizeExt(list) {
+  if (!Array.isArray(list)) return [];
+  const out = [];
+  for (const e of list) {
+    if (!e || !isDate(e.date)) continue;
+    const note = String(e.note || '').trim().slice(0, 200);
+    if (e.type === 'gift') {
+      const days = Math.min(3650, Math.max(0, Math.round(Number(e.days) || 0)));
+      if (days > 0) out.push({ type: 'gift', date: e.date, days, note });
+    } else if (isDate(e.until) && e.until > e.date) {
+      out.push({ type: 'buy', date: e.date, until: e.until, amount: money2(e.amount), note });
+    }
+  }
+  return out.sort((a, b) => a.date.localeCompare(b.date)).slice(-100);
+}
+
+// 延長紀錄不合理時回傳錯誤訊息（給編輯視窗用，存檔前先擋）
+export function validateExt(list) {
+  for (const e of list || []) {
+    const what = e.type === 'gift' ? '序號贈送' : '疊加下訂';
+    if (!isDate(e.date)) return `${what}缺少日期`;
+    if (e.type === 'gift' && !(Number(e.days) >= 1)) return '序號贈送的天數至少 1 天';
+    if (e.type !== 'gift' && !isDate(e.until)) return '疊加下訂請填「延長到」哪天';
+    if (e.type !== 'gift' && e.until <= e.date) return '疊加下訂的「延長到」要晚於下訂日';
+  }
+  return '';
 }
 
 export function normalizeSub(s) {
@@ -104,6 +138,8 @@ export function validatePeriods(periods) {
   for (let i = 0; i < list.length; i++) {
     const p = list[i];
     if (!isDate(p.start)) return `第 ${i + 1} 段缺少開始日`;
+    const extProblem = validateExt(p.ext);
+    if (extProblem) return list.length > 1 ? `第 ${i + 1} 段：${extProblem}` : extProblem;
     if (i < list.length - 1) {
       if (!p.end) return `第 ${i + 1} 段後面還有期間，請填結束日（暫停或取消的那天）`;
       if (p.end > list[i + 1].start) return `第 ${i + 1} 段和第 ${i + 2} 段的日期重疊了`;
@@ -129,9 +165,8 @@ const lastPeriod = sub => sub.periods[sub.periods.length - 1];
 // 效期結束 = 取消（暫停）日之後、原本會扣下一次款的那天；還沒開始扣款就取消（試用期）則是第一次扣款日。
 export function accessEnd(sub, period = lastPeriod(sub)) {
   if (!period.end) return '';
-  for (let k = 0; k < 2000; k++) {
-    const d = periodChargeDate(sub, period, k);
-    if (d >= period.end) return d;
+  for (const { date } of schedule(sub, period)) {
+    if (date >= period.end) return date;
   }
   return period.end;
 }
@@ -149,23 +184,63 @@ export const willRenew = (sub, today = taipeiToday()) => !lastPeriod(sub).end ||
 // 已申請取消或暫停、但效期還沒到
 export const isEnding = (sub, today = taipeiToday()) => isActive(sub, today) && !willRenew(sub, today);
 
-// 某段期間的第 k 次扣款日：以這段開始日的「日」為錨點，遇到月底自動調整（1/31 → 2/28 → 3/31）
-function periodChargeDate(sub, period, k) {
-  const [y, m, d] = period.start.split('-').map(Number);
-  const total = (m - 1) + k * monthsPerCharge(sub);
+// 錨點日往後 n 個月：遇到月底自動調整（1/31 → 2/28 → 3/31）
+function addMonths(anchor, n) {
+  const [y, m, d] = anchor.split('-').map(Number);
+  const total = (m - 1) + n;
   const year = y + Math.floor(total / 12);
   const month = total % 12;
   const last = new Date(Date.UTC(year, month + 1, 0)).getUTCDate();
   return `${year}-${String(month + 1).padStart(2, '0')}-${String(Math.min(d, last)).padStart(2, '0')}`;
 }
+// 往後 n 期（編輯視窗預設「延長到」用）
+export const addCycles = (sub, date, n = 1) => addMonths(date, n * monthsPerCharge(sub));
+const addDaysIso =(date, n) => new Date(Date.parse(date + 'T00:00:00Z') + n * 86400000).toISOString().slice(0, 10);
+
+// 依序產生這段期間「原本」的扣款日（不管 end）。
+// 下一次扣款前有疊加下訂或序號贈送，就把這次扣款延後，之後從新的日期重新起算。
+// 每一項：{ date, shifts: [{ type, from, to, ext }] }（shifts = 這次扣款被延後的紀錄）
+function* schedule(sub, period) {
+  const ext = period.ext || [];
+  const step = monthsPerCharge(sub);
+  let anchor = period.start;
+  let k = 0;
+  let ei = 0;
+  for (let n = 0; n < 2000; n++) {
+    let date = addMonths(anchor, k * step);
+    const shifts = [];
+    while (ei < ext.length && ext[ei].date < date) {
+      const e = ext[ei++];
+      const to = e.type === 'gift' ? addDaysIso(date, e.days) : (e.until > date ? e.until : date);
+      shifts.push({ type: e.type, from: date, to, ext: e });
+      date = to;
+    }
+    if (shifts.length) { anchor = date; k = 0; }
+    yield { date, shifts };
+    k++;
+  }
+}
 
 // 這段期間內、在 [from, to] 之間的扣款日
 function periodCharges(sub, period, to, from = '') {
   const out = [];
-  for (let k = 0; k < 2000; k++) {
-    const d = periodChargeDate(sub, period, k);
-    if (d > to || (period.end && d >= period.end)) break;
-    if (d >= from) out.push(d);
+  for (const { date } of schedule(sub, period)) {
+    if (date > to || (period.end && date >= period.end)) break;
+    if (date >= from) out.push(date);
+  }
+  return out;
+}
+
+// 這段期間內每筆延長實際延了哪一段（期限條、統計用）：[{ type, from, to, ext }]
+export function extSpans(sub, period) {
+  const ext = period.ext || [];
+  if (!ext.length) return [];
+  const out = [];
+  const lastDate = ext[ext.length - 1].date;
+  for (const { date, shifts } of schedule(sub, period)) {
+    out.push(...shifts);
+    // 扣款日超過最後一筆延長的日期，代表所有延長都已套用
+    if (date > lastDate) break;
   }
   return out;
 }
@@ -174,12 +249,9 @@ function periodCharges(sub, period, to, from = '') {
 export function nextCharge(sub, today = taipeiToday()) {
   for (const p of sub.periods) {
     if (p.end && p.end <= today) continue;
-    if (p.start >= today) return p.start;
-    const approx = Math.max(0, Math.floor(dayDiff(p.start, today) / (monthsPerCharge(sub) * 31)) - 1);
-    for (let k = approx; k < approx + 400; k++) {
-      const d = periodChargeDate(sub, p, k);
-      if (p.end && d >= p.end) break;
-      if (d >= today) return d;
+    for (const { date } of schedule(sub, p)) {
+      if (p.end && date >= p.end) break;
+      if (date >= today) return date;
     }
   }
   return null;
@@ -197,8 +269,12 @@ export const toTwd = (amount, currency, rates) => amount * rateOf(currency, rate
 export const estimateTwd = (sub, rates, period = lastPeriod(sub)) =>
   toTwd(period.price, period.currency, rates) * (1 + (period.feePct || 0) / 100);
 
-// 目前這段填過的實際金額（換方案、漲價前的不算）
-const currentActuals = sub => (sub.charges || []).filter(c => c.date >= lastPeriod(sub).start);
+// 目前這段填過的實際金額（換方案、漲價前的不算；疊加下訂那筆金額不固定，也不算）
+const currentActuals = sub => {
+  const cur = lastPeriod(sub);
+  const buys = new Set((cur.ext || []).filter(e => e.type === 'buy').map(e => e.date));
+  return (sub.charges || []).filter(c => c.date >= cur.start && !buys.has(c.date));
+};
 
 // 預估下一期：目前這段填過實際金額就用最近 3 次的平均，否則用估算
 export function chargeTwd(sub, rates) {
@@ -213,20 +289,24 @@ export function monthlyTwd(sub, rates) {
   return chargeTwd(sub, rates) / monthsPerCharge(sub);
 }
 
-// 到今天為止的每一期（跨所有期間）：有實際金額用實際，沒有用估算
+// 到今天為止的每一筆付款（跨所有期間，含疊加下訂）：有實際金額用實際，沒有用估算
+// kind：'charge' 自動扣款、'buy' 疊加下訂
 export function chargeHistory(sub, today = taipeiToday(), rates) {
   const actual = new Map((sub.charges || []).map(c => [c.date, c.twd]));
   const list = [];
   sub.periods.forEach((p, i) => {
     const est = estimateTwd(sub, rates, p);
-    for (const date of periodCharges(sub, p, today)) {
-      list.push({ date, period: i, estimate: est, actual: actual.has(date) ? actual.get(date) : null });
+    const rate = toTwd(1, p.currency, rates) * (1 + (p.feePct || 0) / 100);
+    const add = (date, kind, estimate) => list.push({ date, period: i, kind, estimate, actual: actual.has(date) ? actual.get(date) : null });
+    for (const date of periodCharges(sub, p, today)) add(date, 'charge', est);
+    for (const e of p.ext || []) {
+      if (e.type === 'buy' && e.date <= today && e.amount > 0) add(e.date, 'buy', e.amount * rate);
     }
   });
-  return list;
+  return list.sort((a, b) => a.date.localeCompare(b.date));
 }
 
-export const paidCount = (sub, today = taipeiToday()) => sub.periods.reduce((n, p) => n + periodCharges(sub, p, today).length, 0);
+export const paidCount = (sub, today = taipeiToday()) => chargeHistory(sub, today).length;
 
 export function paidSummary(sub, today, rates) {
   const hist = chargeHistory(sub, today, rates);
@@ -245,7 +325,17 @@ export function periodStats(sub, today = taipeiToday(), rates) {
   let pausedMonths = 0;
   let pauses = 0;
   let saved = 0;
+  let giftDays = 0;
+  let giftValue = 0;
+  let gifts = 0;
+  let buys = 0;
   sub.periods.forEach((p, i) => {
+    // 序號贈送：天數 × 這段的每日費用
+    const perDay = estimateTwd(sub, rates, p) / (monthsPerCharge(sub) * 30.4375);
+    for (const e of p.ext || []) {
+      if (e.date > today) continue;
+      if (e.type === 'gift') { gifts++; giftDays += e.days; giftValue += e.days * perDay; } else buys++;
+    }
     const until = p.end ? accessEnd(sub, p) : '';
     const next = sub.periods[i + 1];
     // 可使用的期間：到效期結束（下一段提早開始就算到下一段）
@@ -259,7 +349,7 @@ export function periodStats(sub, today = taipeiToday(), rates) {
     const missed = periodCharges(sub, { ...p, end: '' }, gapEnd, p.end).filter(d => d < gapEnd || !next).length;
     saved += missed * estimateTwd(sub, rates, p);
   });
-  return { activeMonths, pausedMonths, pauses, saved, periods: sub.periods.length };
+  return { activeMonths, pausedMonths, pauses, saved, gifts, giftDays, giftValue, buys, periods: sub.periods.length };
 }
 
 export function cycleLabel(sub) {
