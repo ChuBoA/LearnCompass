@@ -154,9 +154,9 @@ main { max-width: 1240px; margin: 0 auto; padding: 8px 28px 56px; }
 
 /* ---------- 問候與摘要 ---------- */
 .hero { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.5fr); gap: 28px; align-items: end; padding: 20px 0 30px; }
-.eyebrow { margin: 0 0 6px; color: var(--accent); font-weight: 600; font-size: 14px; letter-spacing: .06em; }
-.greeting h1 { margin: 0; font-size: clamp(28px, 4vw, 40px); font-weight: 900; letter-spacing: .04em; line-height: 1.25; }
-.greeting p:last-child { margin: 10px 0 0; color: var(--muted); max-width: 30em; }
+.eyebrow { margin: 0 0 6px; color: var(--accent); font-weight: 600; font-size: 17px; letter-spacing: .06em; }
+.greeting h1 { margin: 0; font-size: clamp(24px, 3.2vw, 33px); font-weight: 900; letter-spacing: .04em; line-height: 1.25; }
+.greeting p:last-child { margin: 10px 0 0; color: var(--muted); max-width: 22em; line-height: 1.7; }
 .wave { display: inline-block; animation: float 3.2s ease-in-out infinite; }
 @keyframes float { 50% { transform: translateY(-4px) rotate(6deg); } }
 @media (prefers-reduced-motion: reduce) { .wave { animation: none; } }
@@ -483,6 +483,7 @@ dialog.note-dialog { width: min(860px, calc(100vw - 32px)); height: min(900px, c
 
   .hero { padding: 12px 0 22px; }
   .greeting p:last-child { font-size: 14px; }
+  .eyebrow { font-size: 15px; }
   .bento { grid-template-columns: 1fr 1fr; gap: 10px; }
   .bento > * { padding: 16px; border-radius: 20px; }
   .tile-invest { grid-column: 1 / -1; }

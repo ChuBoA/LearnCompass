@@ -526,7 +526,7 @@ function renderHero() {
     <div class="greeting">
       <p class="eyebrow">${dateText}</p>
       <h1>${hello} <span class="wave">${emoji}</span></h1>
-      <p>每一份投入，都會在未來某個時刻化作陽光。今天也往前走一小步吧。</p>
+      <p class="motto">每一份投入，都會在未來某個時刻化作陽光。<br>今天也往前走一小步吧。</p>
     </div>
     <div class="bento">
       <div class="tile-invest">
