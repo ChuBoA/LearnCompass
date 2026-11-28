@@ -8,8 +8,24 @@ export const DEFAULT_SETTINGS = {
   subNotifyDays: [3, 0],              // 訂閱扣款前第幾天推播
   rates: { USD: 32.5, EUR: 35, JPY: 0.21, CNY: 4.5, HKD: 4.2 }, // 1 單位外幣 = 幾元新台幣
   ratesAuto: true,                    // 自動更新匯率
-  ratesUpdatedAt: ''                  // 上次自動更新時間（ISO）
+  ratesUpdatedAt: '',                 // 上次自動更新時間（ISO）
+  travelMode: ''                      // 實體課導航的交通方式：'' Google 預設、transit、driving、walking、bicycling
 };
+
+export const TRAVEL_MODES = [
+  ['', 'Google 預設'], ['transit', '🚇 大眾運輸'], ['driving', '🚗 開車'], ['walking', '🚶 步行'], ['bicycling', '🚲 自行車']
+];
+
+// 實體課的上課地點：場次自己填的優先，沒填就用課程的「上課地點」；直播課回傳空字串
+export const isOnsite = session => session?.mode === 'onsite';
+export const sessionPlace = (course, session) => (isOnsite(session) ? (session.place || course.location || '').trim() : '');
+
+// Google 地圖連結（不需要 API 金鑰）：導航（從目前位置出發）與查看地點
+export function mapsDirUrl(place, travelMode = '') {
+  const mode = TRAVEL_MODES.some(([v]) => v && v === travelMode) ? `&travelmode=${travelMode}` : '';
+  return `https://www.google.com/maps/dir/?api=1&destination=${encodeURIComponent(place)}${mode}`;
+}
+export const mapsSearchUrl = place => `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(place)}`;
 
 const WEEKDAYS = ['日', '一', '二', '三', '四', '五', '六'];
 
@@ -105,10 +121,12 @@ export function computePushMessages(courses, settings = DEFAULT_SETTINGS, now = 
     for (const { course, session, daysUntil } of sessions) {
       if (daysUntil > 1) continue;
       const time = session.at.length > 10 ? session.at.slice(11, 16) : '';
+      const place = sessionPlace(course, session);
+      const where = place ? `\n📍 ${place}，記得預留交通時間` : (isOnsite(session) ? '\n📍 實體課，記得預留交通時間' : '');
       messages.push({
         tag: `session-${course.id}-${session.at}`,
         title: daysUntil === 0 ? '📅 今天要上課' : '📅 明天要上課',
-        body: `《${course.name}》${session.label ? session.label + ' ' : ''}${time}`.trim()
+        body: `《${course.name}》${session.label ? session.label + ' ' : ''}${time}`.trim() + where
       });
     }
   }

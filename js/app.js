@@ -2,7 +2,8 @@ import { createStore, getPushToken } from './store.js';
 import { csvToCourses, coursesToCsv, mergeImport, normalizeCourse, newId, sessionLink } from './csv.js';
 import {
   DEFAULT_SETTINGS, computeAlerts, courseStatus, daysLeft, upcomingSessions,
-  formatSession, taipeiToday, idleDays, dayDiff
+  formatSession, taipeiToday, idleDays, dayDiff,
+  TRAVEL_MODES, isOnsite, sessionPlace, mapsDirUrl, mapsSearchUrl
 } from './reminders.js';
 import {
   AUTO_LOCK_CHOICES, lockSettings, needsUnlock, markUnlocked, markLocked, watchVisibility,
@@ -71,6 +72,21 @@ const icon = name => `<svg class="i"><use href="#i-${name}"/></svg>`;
 const sessionLinkBtn = (session, cls = 'btn dark small') => {
   const link = safeUrl(session?.link);
   return link ? `<a class="${cls}" data-action="go" href="${esc(link)}" target="_blank" rel="noopener">上課連結${icon('arrow')}</a>` : '';
+};
+// 場次的主要按鈕：實體課「導航」（可加「看地圖」），直播課「上課連結」
+function sessionActions(course, session, cls = 'btn dark small', withMap = false) {
+  if (!isOnsite(session)) return sessionLinkBtn(session, cls);
+  const place = sessionPlace(course, session);
+  if (!place) return '';
+  const nav = `<a class="${cls}" data-action="go" href="${esc(mapsDirUrl(place, state.settings.travelMode))}" target="_blank" rel="noopener">${icon('nav')}導航</a>`;
+  const map = withMap ? `<a class="btn ghost small" data-action="go" href="${esc(mapsSearchUrl(place))}" target="_blank" rel="noopener">${icon('place')}看地圖</a>` : '';
+  return nav + map;
+}
+// 實體課的地點文字（直播課回傳空字串）
+const placeText = (course, session) => {
+  if (!isOnsite(session)) return '';
+  const place = sessionPlace(course, session);
+  return place ? `📍 ${esc(place)}` : '📍 實體課（還沒填地點）';
 };
 const sum = (arr, f) => arr.reduce((t, x) => t + (f(x) || 0), 0);
 const emojiOf = cat => CATEGORY_EMOJI[cat] || '📚';
@@ -377,8 +393,21 @@ function bindEvents() {
   // 編輯視窗
   const form = $('#editor-form');
   form.energy.addEventListener('input', () => { $('#energy-out').textContent = form.energy.value + '%'; });
-  $('#btn-add-session').addEventListener('click', () => addSessionRow({ at: '', label: '' }, true));
+  $('#btn-add-session').addEventListener('click', () => {
+    // 新場次沿用上一堂的類型；第一堂則看課程有沒有填上課地點
+    const rows = $$('#sessions .session-row');
+    const mode = rows.length ? rows[rows.length - 1].querySelector('.session-mode').value : (form.location.value.trim() ? 'onsite' : 'online');
+    addSessionRow({ at: '', label: '', mode }, true);
+  });
   $('#sessions').addEventListener('click', e => { if (e.target.closest('[data-remove]')) e.target.closest('.session-row').remove(); });
+  $('#sessions').addEventListener('change', e => {
+    if (e.target.matches('.session-mode')) syncSessionRow(e.target.closest('.session-row'));
+    if (e.target.matches('.session-place')) showMapPreview(e.target.value.trim() || form.location.value.trim());
+  });
+  form.location.addEventListener('change', () => {
+    $$('#sessions .session-place').forEach(i => { i.placeholder = placePlaceholder(); });
+    showMapPreview(form.location.value.trim());
+  });
   $$('dialog [data-close]').forEach(b => b.addEventListener('click', () => b.closest('dialog').close()));
   form.addEventListener('submit', submitEditor);
   $('#pin-form').addEventListener('submit', submitPin);
@@ -515,7 +544,7 @@ function renderHero() {
   const x = alerts.expiring[0];
   if (s) {
     next = `<small>下一站・${s.daysUntil === 0 ? '今天' : s.daysUntil === 1 ? '明天' : `${s.daysUntil} 天後`}</small>
-      <strong>${esc(s.course.name)}</strong><span>${icon('cal')}${formatSession(s.session.at)} ${esc(s.session.label)}</span>`;
+      <strong>${esc(s.course.name)}</strong><span>${icon('cal')}${formatSession(s.session.at)} ${esc(s.session.label)}</span>${isOnsite(s.session) ? `<small class="hero-place">${placeText(s.course, s.session)}</small>` : ''}`;
   } else if (x) {
     next = `<small>記得看完・剩 ${x.daysLeft} 天</small><strong>${esc(x.course.name)}</strong><span>${icon('clock')}${fmtDate(x.course.accessUntil)} 到期</span>`;
   } else {
@@ -540,7 +569,7 @@ function renderHero() {
       </div>
       <div class="tile-next-wrap">
         <button type="button" class="tile-next" data-action="tab" data-tab="alerts">${next}</button>
-        ${s ? sessionLinkBtn(s.session, 'btn dark small hero-link') : ''}
+        ${s ? sessionActions(s.course, s.session, 'btn dark small hero-link') : ''}
       </div>
     </div>`;
 }
@@ -608,7 +637,7 @@ function courseCard(c, today, noteCount = 0) {
     </div>
     <h3>${esc(c.name)}</h3>
     ${c.note ? `<p class="note" title="點一下展開">${linkify(c.note)}</p>` : ''}
-    ${next ? `<p class="next-session">${icon('cal')}<span>下次上課 <b>${formatSession(next.at)}</b> ${esc(next.label)}</span>${sessionLinkBtn(next, 'ns-link')}</p>` : ''}
+    ${next ? `<p class="next-session ${isOnsite(next) ? 'onsite' : ''}">${icon('cal')}<span>下次上課 <b>${formatSession(next.at)}</b> ${esc(next.label)}${isOnsite(next) ? `<small class="ns-place">${placeText(c, next)}</small>` : ''}</span>${sessionActions(c, next, 'ns-link')}</p>` : ''}
     <div class="meta">
       <span>${icon('user')}${esc(c.teacher || '—')}</span>
       <span>${icon('globe')}${esc(c.platform || '—')}</span>
@@ -1185,7 +1214,7 @@ function emptyState() {
 function alertItem(c, sideHtml, extra = '', session = null) {
   const link = safeUrl(c.link);
   // 場次有自己的連結就優先顯示「上課連結」，課程網址改成次要按鈕
-  const sLink = sessionLinkBtn(session);
+  const sLink = session ? sessionActions(c, session, 'btn dark small', true) : '';
   return `<li class="alert-item">
     <div class="alert-main">
       <strong>${esc(c.name)}</strong>
@@ -1211,7 +1240,7 @@ function renderAlerts(alerts) {
       <h2>${icon('cal')}即將上課 <small>未來 14 天</small></h2>
       ${sessions.length ? `<ul class="alert-list">${sessions.map(({ course, session, daysUntil }) =>
         alertItem(course, `<span class="when ${daysUntil <= 1 ? 'danger' : ''}">${dayText(daysUntil)}</span><small>${formatSession(session.at)}</small>`,
-          session.label ? `・${esc(session.label)}` : '', session)).join('')}</ul>`
+          `${session.label ? `・${esc(session.label)}` : ''}${isOnsite(session) ? `<br>${placeText(course, session)}` : ''}`, session)).join('')}</ul>`
         : '<p class="muted-text">近期沒有直播或實體課。可在課程的「編輯」中新增上課場次。</p>'}
     </div>
     <div class="panel">
@@ -1266,6 +1295,9 @@ function renderStats() {
   const statusOf = k => byStatus.find(g => g.key === k) || { count: 0, spend: 0 };
   const paid = list.filter(c => c.price > 0);
   const free = list.length - paid.length;
+  const allSessions = list.flatMap(c => c.sessions || []);
+  const onsiteCount = allSessions.filter(isOnsite).length;
+  const upcomingOnsite = allSessions.filter(s => isOnsite(s) && s.at.slice(0, 10) >= today).length;
   const wake = list.filter(c => courseStatus(c, today) !== 'expired' && c.energy < 100)
     .map(c => ({ c, idle: c.price * (100 - c.energy) / 100 }))
     .sort((a, b) => b.idle - a.idle).slice(0, 10);
@@ -1286,6 +1318,7 @@ function renderStats() {
         <button type="button" class="legend-item" data-action="filter-status" data-value="${k}">
           <i class="dot ${k}"></i>${STATUS_LABEL[k]}<b>${statusOf(k).count}</b><small>${money(statusOf(k).spend)}</small>
         </button>`).join('')}</div>
+      ${allSessions.length ? `<p class="muted-text session-split">上課場次：📍 實體課 <b>${onsiteCount}</b> 堂／💻 直播 <b>${allSessions.length - onsiteCount}</b> 堂${upcomingOnsite ? `・之後還有 ${upcomingOnsite} 堂實體課` : ''}</p>` : ''}
     </div>
 
     <div class="panel">
@@ -1384,6 +1417,9 @@ function renderSettings() {
         <fieldset data-setting>
           <legend>直播／實體課</legend>
           <label class="chip"><input type="checkbox" name="sessionNotify" ${s.sessionNotify ? 'checked' : ''}><span>上課前一天與當天提醒</span></label>
+          <label class="inline">實體課導航的交通方式
+            <select name="travelMode">${TRAVEL_MODES.map(([v, label]) => `<option value="${v}" ${(s.travelMode || '') === v ? 'selected' : ''}>${label}</option>`).join('')}</select></label>
+          <p class="muted-text">選「Google 預設」時由 Google 地圖決定；騎機車可在 Google 地圖 APP 裡切換。</p>
         </fieldset>
         <fieldset data-setting>
           <legend>久未學習提醒</legend>
@@ -1431,6 +1467,7 @@ async function saveSettingsFromForm() {
   const s = {
     expiryNotifyDays: [...root.querySelectorAll('[name=expiryNotifyDays]:checked')].map(i => Number(i.value)),
     sessionNotify: root.querySelector('[name=sessionNotify]').checked,
+    travelMode: root.querySelector('[name=travelMode]')?.value || '',
     staleDays: Math.max(3, Number(root.querySelector('[name=staleDays]').value) || DEFAULT_SETTINGS.staleDays),
     staleDigestWeekday: Number(root.querySelector('[name=staleDigestWeekday]').value),
     subNotifyDays: [...root.querySelectorAll('[name=subNotifyDays]:checked')].map(i => Number(i.value)),
@@ -1495,16 +1532,47 @@ async function testNotify() {
 }
 
 // ---------- 編輯視窗 ----------
+function placePlaceholder() {
+  const loc = $('#editor-form').location.value.trim();
+  return loc ? `同課程地點：${loc}` : '這堂的地點（地址或地點名稱）';
+}
+
 function addSessionRow(session, focus = false) {
   const row = document.createElement('div');
   row.className = 'session-row';
+  const onsite = session.mode === 'onsite';
   row.innerHTML = `
-    <input type="datetime-local" value="${esc(session.at.length === 10 ? session.at + 'T00:00' : session.at)}" aria-label="上課時間">
-    <input type="text" value="${esc(session.label)}" placeholder="說明（例如：第一週）" aria-label="場次說明">
+    <input type="datetime-local" class="session-at" value="${esc(session.at.length === 10 ? session.at + 'T00:00' : session.at)}" aria-label="上課時間">
+    <input type="text" class="session-label" value="${esc(session.label)}" placeholder="說明（例如：第一週）" aria-label="場次說明">
     <button type="button" class="btn plain icon-only" data-remove aria-label="移除場次">${icon('x')}</button>
-    <input type="text" class="session-link" inputmode="url" value="${esc(session.link || '')}" placeholder="連結（選填）：直播網址、教室地圖" aria-label="場次連結">`;
+    <div class="session-where">
+      <select class="session-mode" aria-label="上課方式">
+        <option value="online" ${onsite ? '' : 'selected'}>💻 直播</option>
+        <option value="onsite" ${onsite ? 'selected' : ''}>📍 實體</option>
+      </select>
+      <input type="text" class="session-link" inputmode="url" value="${esc(session.link || '')}" placeholder="直播連結（選填）" aria-label="直播連結">
+      <input type="text" class="session-place" maxlength="200" value="${esc(session.place || '')}" placeholder="${esc(placePlaceholder())}" aria-label="這堂的地點">
+    </div>`;
   $('#sessions').append(row);
+  syncSessionRow(row);
   if (focus) row.querySelector('input').focus();
+}
+
+// 直播顯示連結欄位，實體顯示地點欄位
+function syncSessionRow(row) {
+  const onsite = row.querySelector('.session-mode').value === 'onsite';
+  row.querySelector('.session-link').hidden = onsite;
+  row.querySelector('.session-place').hidden = !onsite;
+}
+
+// 編輯視窗裡的地圖預覽（Google 地圖內嵌，不需要 API 金鑰）
+function showMapPreview(place) {
+  const box = $('#map-preview');
+  if (!place) { box.hidden = true; box.querySelector('iframe').src = 'about:blank'; return; }
+  const src = `https://maps.google.com/maps?q=${encodeURIComponent(place)}&z=16&hl=zh-TW&output=embed`;
+  $('#map-preview-name').textContent = place;
+  if (box.querySelector('iframe').src !== src) box.querySelector('iframe').src = src;
+  box.hidden = false;
 }
 
 function openEditor(id) {
@@ -1513,12 +1581,13 @@ function openEditor(id) {
   const form = $('#editor-form');
   form.reset();
   const c = course || { energy: 0, purchaseDate: taipeiToday(), sessions: [] };
-  for (const key of ['name', 'teacher', 'category', 'platform', 'price', 'purchaseDate', 'accessUntil', 'energy', 'link', 'note']) {
+  for (const key of ['name', 'teacher', 'category', 'platform', 'price', 'purchaseDate', 'accessUntil', 'energy', 'link', 'location', 'note']) {
     form[key].value = c[key] ?? '';
   }
   $('#energy-out').textContent = (c.energy || 0) + '%';
   $('#sessions').innerHTML = '';
   (c.sessions || []).forEach(s => addSessionRow(s));
+  showMapPreview((c.location || '').trim());
   $('#editor-title').textContent = course ? '編輯課程' : '新增課程';
   $('#editor').showModal();
 }
@@ -1530,14 +1599,17 @@ async function submitEditor(e) {
   const now = new Date().toISOString();
   const energy = Number(form.energy.value);
   const sessions = $$('#sessions .session-row').map(r => {
-    const [at, label, link] = r.querySelectorAll('input');
-    return { at: at.value, label: label.value.trim(), link: sessionLink(link.value) };
+    const val = sel => r.querySelector(sel).value.trim();
+    const mode = val('.session-mode') === 'onsite' ? 'onsite' : 'online';
+    // 實體課的地點跟課程地點一樣就不另外存，之後改課程地點會一起更新
+    const place = mode === 'onsite' && val('.session-place') !== form.location.value.trim() ? val('.session-place') : '';
+    return { at: val('.session-at'), label: val('.session-label'), link: mode === 'online' ? sessionLink(val('.session-link')) : '', mode, place };
   }).filter(s => s.at).sort((a, b) => a.at.localeCompare(b.at));
   const course = {
     ...(old || { id: newId(), createdAt: now }),
     name: form.name.value, teacher: form.teacher.value, category: form.category.value,
     platform: form.platform.value, price: form.price.value, purchaseDate: form.purchaseDate.value,
-    accessUntil: form.accessUntil.value, energy, link: form.link.value, note: form.note.value,
+    accessUntil: form.accessUntil.value, energy, link: form.link.value, location: form.location.value.trim(), note: form.note.value,
     sessions, updatedAt: now,
     lastStudiedAt: old && energy > old.energy ? now : old?.lastStudiedAt || null
   };

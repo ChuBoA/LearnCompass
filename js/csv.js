@@ -11,6 +11,7 @@ const COLUMNS = [
   ['accessUntil', '觀看權限'],
   ['energy', '學習能量'],
   ['link', '快速傳送門'],
+  ['location', '上課地點'],
   ['sessions', '上課場次'],
   ['lastStudiedAt', '最後學習日']
 ];
@@ -66,19 +67,34 @@ export function sessionLink(value) {
   return /^[\w-]+(\.[\w-]+)+([\/?#].*)?$/.test(v) ? ('https://' + v).slice(0, 1000) : '';
 }
 
-// "2026-11-02 20:30 第一周 https://…; ..." ⇄ [{at, label, link}]（連結放在最後，可省略）
+// "2026-11-02 20:30 第一周 https://…; 2026-11-09 14:00 第二週 @台北市…" ⇄ [{at, label, link, mode, place}]
+// 連結放在說明後面；「@」表示實體課，後面接這堂的地點（只寫「@」就用課程的上課地點）
 function parseSessionsField(value) {
   return String(value || '').split(/[;；\n]/).map(s => s.trim()).filter(Boolean).map(s => {
     const m = s.match(/^(\d{4}[\/\-]\d{1,2}[\/\-]\d{1,2})(?:[ T](\d{1,2}:\d{2}))?\s*(.*)$/);
     if (!m) return null;
     const time = m[2] ? 'T' + m[2].padStart(5, '0') : '';
-    const rest = (m[3] || '').match(/^(.*?)\s*(https?:\/\/\S+)?$/);
-    return { at: normalizeDate(m[1]) + time, label: rest[1] || '', link: rest[2] || '' };
+    // 「@」前面要有空白（或在最前面），避免把網址裡的 @ 當成地點
+    const at = (m[3] || '').match(/^(.*?)(?:(?:^|\s+)@(.*))?$/);
+    const rest = at[1].match(/^(.*?)\s*(https?:\/\/\S+)?$/);
+    const onsite = at[2] !== undefined;
+    return { at: normalizeDate(m[1]) + time, label: rest[1] || '', link: rest[2] || '', mode: onsite ? 'onsite' : 'online', place: onsite ? at[2].trim() : '' };
   }).filter(Boolean);
 }
 
 function formatSessionsField(sessions) {
-  return (sessions || []).map(s => `${s.at.replace('T', ' ')}${s.label ? ' ' + s.label : ''}${s.link ? ' ' + s.link : ''}`).join('; ');
+  return (sessions || []).map(s => `${s.at.replace('T', ' ')}${s.label ? ' ' + s.label : ''}${s.link ? ' ' + s.link : ''}${s.mode === 'onsite' ? ' @' + (s.place || '') : ''}`).join('; ');
+}
+
+function normalizeSession(s) {
+  const onsite = s.mode === 'onsite';
+  return {
+    at: s.at,
+    label: s.label || '',
+    link: sessionLink(s.link),
+    mode: onsite ? 'onsite' : 'online',
+    place: onsite ? String(s.place || '').trim().slice(0, 200) : ''
+  };
 }
 
 export function newId() {
@@ -99,7 +115,8 @@ export function normalizeCourse(c) {
     accessUntil: normalizeDate(c.accessUntil),
     energy: Math.min(100, Math.max(0, Math.round(Number(c.energy) || 0))),
     link: String(c.link || '').trim(),
-    sessions: (c.sessions || []).filter(s => s && s.at).map(s => ({ at: s.at, label: s.label || '', link: sessionLink(s.link) })),
+    location: String(c.location || '').trim().slice(0, 200),
+    sessions: (c.sessions || []).filter(s => s && s.at).map(normalizeSession),
     lastStudiedAt: c.lastStudiedAt || null,
     createdAt: c.createdAt || now,
     updatedAt: c.updatedAt || now
@@ -129,6 +146,7 @@ export function csvToCourses(text) {
       accessUntil: get('accessUntil'),
       energy: get('energy'),
       link: get('link'),
+      location: get('location'),
       sessions,
       lastStudiedAt: get('lastStudiedAt') || null
     });
@@ -166,6 +184,7 @@ export function mergeImport(existing, incoming) {
     return {
       ...c,
       id: old.id,
+      location: c.location || old.location || '',
       sessions,
       lastStudiedAt: c.lastStudiedAt || old.lastStudiedAt,
       createdAt: old.createdAt,
